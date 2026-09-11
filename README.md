@@ -15,11 +15,11 @@ Because loan defaults were the minority class, model evaluation focused on **rec
 
 ## Results
 
-The final model selected for prediction was **XGBoost**, using class weighting, cross-validation, and probability threshold optimization. :contentReference[oaicite:0]{index=0}
+The final model selected for prediction was **XGBoost**, using class weighting, cross-validation, and probability threshold optimization. 
 
-The selected XGBoost model achieved an **F1 score of approximately 0.57** and correctly identified roughly two-thirds of loan defaults. :contentReference[oaicite:1]{index=1}
+The selected XGBoost model achieved an **F1 score of approximately 0.57** and correctly identified roughly two-thirds of loan defaults. 
 
-Neural network models were also competitive, with the strongest reaching an **AUC of 0.825** and **recall of 0.665**. :contentReference[oaicite:2]{index=2}
+Neural network models were also competitive, with the strongest reaching an **AUC of 0.825** and **recall of 0.665**.
 
 ## Tools
 
