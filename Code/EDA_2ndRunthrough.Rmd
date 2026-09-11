@@ -1,0 +1,163 @@
+---
+title: "Grading Student Project Data"
+subtitle: "EDA and Data Preprocessing"
+output:
+  html_document:
+    code_folding: show
+    df_print: paged
+    number_sections: yes
+    theme: cerulean
+    toc: yes
+    toc_float: true
+    code_download: true
+
+---
+
+```{r setup, include=FALSE,message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE,warning=FALSE)
+knitr::opts_chunk$set(fig.width=6, fig.height=4)
+
+if(require(pacman)==0)
+   {install.packages("pacman")}
+pacman::p_load(devtools,caret,fastDummies,tidyverse,skimr, GGally,DataExplorer,ggrepel,ggthemes,dslabs,rpart,rpart.plot,randomForest,xgboost,ROCR,knitr,rmarkdown)
+```
+
+# Load Data
+
+```{r}
+file_to_grade <- "df_flags_2nd_run.rds"
+dat <- readRDS(file_to_grade)
+
+cat("Loaded:", basename(file_to_grade), "\n")
+dim(dat)
+```
+
+100 variables??? Yikes!
+
+# Row Count Check
+
+```{r}
+original_n <- 237730  
+student_n <- nrow(dat)
+cat("Original rows:", original_n, "\n")
+cat("Student rows:", student_n, "\n")
+cat("Rows lost:", original_n - student_n, "\n")
+```
+
+You lost a nominal amount of data.
+
+
+# Factor Check
+
+All strings should be factors and the number of levels should be reasonable.
+
+```{r}
+dat %>%
+  summarise(across(everything(), ~class(.)[1])) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Type") %>%
+  arrange(Type) %>% 
+  print(n=Inf)
+
+# Quick look at factor variables and their number of levels
+dat %>%
+  select(where(is.factor)) %>%
+  summarise(across(everything(), ~nlevels(.))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Levels") %>%
+  arrange(desc(Levels))
+```
+
+You need to transform or remove date before modeling.  Looks like everything is binned and converted to binary.  Interesting approach.  We will see how it works. No explanations in your RMD, so I can't really follow what you did.
+
+
+# Check for missing
+
+```{r}
+plot_missing(dat)
+```
+No missing.
+
+# Check Target
+
+Should be a factor coded "No","Yes"
+
+```{r}
+class(dat$loan_default)
+table(dat$loan_default)
+levels(dat$loan_default)
+```
+Good!
+
+# Check Correlations
+
+Should not have any variables that are very highly correlated.
+
+```{r}
+dat %>% 
+  select(where(is.numeric)) %>% 
+  select(where(~!is.integer(.))) %>% 
+  plot_correlation()
+```
+
+Hard to read the plot, but you have some very highly correlated variables in the data. If there are redundancies, some models will not run.
+
+# Check Numerical Summaries
+
+Checking for zero standard deviations, outliers.
+
+```{r}
+dat %>%
+  select(where(is.numeric)) %>%
+  #select(where(~!is.integer(.))) %>% 
+  summarise(across(
+    everything(),
+    list(
+      mean = ~mean(., na.rm = TRUE),
+      sd = ~sd(., na.rm = TRUE),
+      min = ~min(., na.rm = TRUE),
+      q25 = ~quantile(., 0.25, na.rm = TRUE),
+      median = ~median(., na.rm = TRUE),
+      q75 = ~quantile(., 0.75, na.rm = TRUE),
+      max = ~max(., na.rm = TRUE)
+    ),
+    .names = "{.col}__{.fn}"
+  )) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("Variable", "Statistic"),
+    names_sep = "__",
+    values_to = "Value"
+  ) %>%
+  pivot_wider(names_from = Statistic, values_from = Value) %>%
+  arrange(Variable) %>%
+  kable(
+    digits = 2,
+    caption = "Numeric Variable Summary (Mean, SD, Min, 25th, Median, 75th, Max)"
+  )
+```
+
+Some of your dummy variables are mostly 0 as indicated by the very small mean and std. dev.  YOu may have some challenges.
+
+# Check Barplots
+
+Should not have any categorical variables with only one (or nearly one) level
+
+```{r}
+plot_bar(dat,nrow=3,ncol=2)
+```
+
+Some very sparse levels.  This may mean some predictors won't be meaningful.  
+
+# Check Histograms
+
+Should not have any odd patterns or variables with only one (or very few) value(s).
+
+```{r}
+plot_histogram(dat,nrow=3,ncol=2)
+```
+
+There are some problems here with sparsity. You have transformed a lot of variables.  This may be ok.  But if your predictions are not good, consider going back to the raw data.
+
+
+# Final comments
+
+There are still a few problems with your data that will make modeling a challenge.  I recommend taking another pass at cleaning up the data before you start.  I tried to follow along with your markdown.  While it is organized, there is limited logic or annotation noted,and I had difficulty understanding your reasoning.  
