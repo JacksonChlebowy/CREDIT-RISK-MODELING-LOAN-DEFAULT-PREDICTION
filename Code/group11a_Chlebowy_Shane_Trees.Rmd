@@ -1,0 +1,626 @@
+---
+title: "group11a_Chlebowy_Shane_Trees"
+output: html_document
+date: "2025-11-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Reading the data
+Prior to this, we applied our data cleaning on the holdout sample and addressed the issue with an ANY level appearing in the home_ownership variable
+```{r}
+file <- "train_trees.rds"
+df_trees <- readRDS(file)
+
+holdout = "holdout_trees.rds"
+holdout_trees = readRDS(holdout)
+
+# Load all packages used in this analysis
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(MLmetrics)
+library(ROCR)
+library(dplyr)
+library(ggplot2)  # optional but loaded by caret/ROCR plots
+
+
+```
+
+
+# Undersampling the data
+Balancing Yes/No's in the training data to help build a more generalizable models that can better predict on unseen data. We fit some trees with the balanced data, and some with the raw data 
+```{r}
+
+set.seed(123)
+
+df_trees_balanced = df_trees %>%
+  group_by(loan_default) %>%
+  sample_n(size = min(table(df_trees$loan_default))) %>%
+  ungroup()
+
+table(df_trees_balanced$loan_default) # it is balanced
+
+saveRDS(df_trees_balanced, "df_trees_balanced.rds")
+
+```
+
+
+# TREE 1 - Basic Tree
+
+```{r}
+set.seed(123)
+
+TREE_1 <- rpart::rpart(
+  loan_default ~ .,
+  data = df_trees,
+  method = "class",
+  control = rpart::rpart.control(cp = 0, minsplit = 5000, minbucket = 2500) 
+)
+
+options(scipen = 999)
+
+rpart.plot::rpart.plot(TREE_1, extra = 1, fallen.leaves = TRUE) ## Very basic
+
+```
+Almost all of the splits are on dates. I believe this could be a result of too strict controls
+
+## Predictions and Confusion Matrix
+```{r}
+
+Tree1_train_pred = predict(TREE_1,
+                    df_trees,
+                    type = "class")
+
+
+tree_preds = data.frame( Actuals = holdout_trees$loan_default)
+
+tree_preds$Tree1_class = predict(TREE_1,
+                              holdout_trees,
+                              type = "class")
+tree_preds$Tree1_prob = predict(TREE_1,
+                              holdout_trees,
+                              type = "prob")[,"Yes"]
+
+confusionMatrix(Tree1_train_pred,
+                df_trees$loan_default,
+                positive = "Yes")
+
+Tree1_hold_pred = predict(TREE_1,
+                    holdout_trees,
+                    type = "class")
+confusionMatrix(Tree1_hold_pred,
+                holdout_trees$loan_default,
+                positive = "Yes")
+
+```
+Very ineffective model. Low recall (.33) and only a 2% improvement to the No Information Rate. Not a very good tree at all
+
+
+# TREE 2 -- Cross-validated Tree
+
+
+## Cross Validating
+cross-validating to give the model more train/test splits and to optimize cp. It should make for a more accurate and more generalizable model. Adjusted controls to fit deeper trees
+```{r} 
+set.seed(123)
+
+CV_TREE <- rpart::rpart(
+  loan_default ~ .,
+  data = df_trees,
+  method = "class",
+  control = rpart::rpart.control(cp = 0, xval = 10, minsplit = 500, minbucket = 250, maxdepth = 25)
+) ## changed controls to fit deeper trees 
+
+printcp(CV_TREE)
+plotcp(CV_TREE)
+
+
+best_cp <- CV_TREE$cptable[which.min(CV_TREE$cptable[,"xerror"]), "CP"]
+print(best_cp) ## 0.002198061
+
+
+```
+
+
+## Pruning TREE2
+```{r}
+TREE_2 <- prune(CV_TREE, cp = best_cp)
+
+options(scipen = 999)
+
+rpart.plot::rpart.plot(TREE_2, extra = 1, fallen.leaves = TRUE)
+```
+This Resulted in a much deeper tree, and it looks like it is splitting on more than just the date variables.
+
+## Predictions and ConfusionMatrix
+```{r}
+
+Tree2_train_pred = predict(TREE_2,
+                    df_trees,
+                    type = "class")
+
+
+tree_preds$Tree2_class = predict(TREE_2,
+                              holdout_trees,
+                              type = "class")
+tree_preds$Tree2_prob = predict(TREE_2,
+                             holdout_trees,
+                             type = "prob")[,"Yes"]
+
+
+
+confusionMatrix(Tree2_train_pred,
+                df_trees$loan_default,
+                positive = "Yes")
+
+Tree2_hold_pred = predict(TREE_2,
+                    holdout_trees,
+                    type = "class")
+
+
+confusionMatrix(Tree2_hold_pred,
+                holdout_trees$loan_default,
+                positive = "Yes")
+
+```
+Improved overall accuracy and detection rate slightly, but still only a 3% gain from the No Information Rate. Recall is still only 38%. Not a very good model either
+
+
+# TREE 3 - Cross-Validated Tree with Balanced Data
+We changed controls again, allowing for smaller nodes
+## Cross Validating
+```{r}
+
+set.seed(123)
+
+CV2_TREE <- rpart::rpart(
+  loan_default ~ .,
+  data = df_trees_balanced,
+  method = "class",
+  control = rpart::rpart.control(cp = .0002, xval = 10, minsplit = 200, minbucket = 100, maxdepth = 15)
+)
+
+printcp(CV2_TREE)
+plotcp(CV2_TREE)
+
+
+best_cp2 <- CV2_TREE$cptable[which.min(CV2_TREE$cptable[,"xerror"]), "CP"]
+print(best_cp2) #0.000214445
+```
+
+## Pruning TREE 3
+```{r}
+
+
+TREE_3 <- prune(CV2_TREE, cp = best_cp2)
+
+options(scipen = 999)
+
+rpart.plot::rpart.plot(TREE_3, extra = 1, fallen.leaves = TRUE)
+
+```
+Very deep tree, appears to have more depth than the previous
+
+## Predictions and ConfusionMatrix
+
+```{r}
+
+Tree3_train_pred = predict(TREE_3,
+                    df_trees_balanced,
+                    type = "class")
+
+Tree3_hold_pred = predict(TREE_3,
+                    holdout_trees,
+                    type = "class")
+
+
+tree_preds$Tree3_class = predict(TREE_3,
+                              holdout_trees,
+                              type = "class")
+tree_preds$Tree3_prob = predict(TREE_3,
+                             holdout_trees,
+                             type = "prob")[,"Yes"]
+
+confusionMatrix(Tree3_train_pred,
+                df_trees_balanced$loan_default,
+                positive = "Yes") 
+
+confusionMatrix(Tree3_hold_pred,
+                holdout_trees$loan_default,
+                positive = "Yes") 
+```
+Significantly better model. Overall Accuracy is 76%, a 26% jump from a no information rate of 50%. Recall of .7745 is significantly better compared to previous models. Only able to correctly ID 38% of Yes's, but much better than previous models.
+
+
+
+# TREE 4 -- Balanced cv Tree using "information"
+Experimenting using information instead of Gini to split the trees
+
+```{r}
+
+set.seed(123)
+
+CV3_TREE <- rpart::rpart(
+  loan_default ~ .,
+  data = df_trees_balanced,
+  method = "class",
+  parms = list(split = "information"),
+  control = rpart::rpart.control(
+    cp = 0.0002,
+    xval = 10,
+    minsplit = 200,
+    minbucket = 100,
+    maxdepth = 15
+  )
+)
+
+
+printcp(CV3_TREE)
+plotcp(CV3_TREE)
+
+
+best_cp3 <- CV3_TREE$cptable[which.min(CV3_TREE$cptable[,"xerror"]), "CP"]
+print(best_cp3) #0.000343112
+
+```
+
+## Pruning Tree 4
+
+```{r}
+
+TREE_4 <- prune(CV3_TREE, cp = best_cp3)
+options(scipen = 999)
+rpart.plot::rpart.plot(TREE_4, extra = 1, fallen.leaves = FALSE)
+
+```
+A shallower tree then other previous trees
+
+## Predictions and Confusion Matrix
+```{r}
+
+Tree4_train_pred = predict(TREE_4,
+                    df_trees_balanced,
+                    type = "class")
+Tree4_hold_pred = predict(TREE_4,
+                    holdout_trees,
+                    type = "class")
+
+tree_preds$Tree4_class = predict(TREE_4,
+                               holdout_trees,
+                               type = "class")
+tree_preds$Tree4_prob = predict(TREE_4,
+                              holdout_trees,
+                              type = "prob")[,"Yes"]
+
+confusionMatrix(Tree4_train_pred,
+                df_trees_balanced$loan_default,
+                positive = "Yes") 
+
+confusionMatrix(Tree4_hold_pred,
+                holdout_trees$loan_default,
+                positive = "Yes")
+
+
+```
+
+Very similar model compared to the last. Overall Accuracy is 75.5%, and recall of 76%. Detection rate took a small dip. Less accuracy and sensitivity drop on the holdout, so potentially a slightly better model than Tree 3
+
+# TREE 5 -- Using Caret, optimizing threshold
+trying some new things, like using a tune grid to find the best cp, and using reapeatcv to get even more cross validation. We also optimize threshold for this tree trying to improve recall
+
+```{r}
+set.seed(123)
+
+grid <- expand.grid(
+  cp = seq(0.0002, 0.002, by = 0.00005)  # Range of cp's to try
+)
+
+train_control <- trainControl(
+  method = "repeatedcv", number = 10, repeats = 3,  # fitting 10 models at each split, 3 times (30 trees for each cp split) should help us find the best possible model
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE,
+  savePredictions = TRUE
+)
+
+CV5_TREE <- train(
+  loan_default ~ .,
+  data = df_trees_balanced,
+  method = "rpart",
+  trControl = train_control,
+  tuneGrid = grid,
+  metric = "ROC"
+)
+
+print(CV5_TREE$bestTune)
+plot(CV5_TREE)
+
+
+best_cp <- CV5_TREE$bestTune$cp
+
+
+```
+## Fitting and Pruning Tree 5
+```{r}
+
+TREE_5 <- rpart(
+  loan_default ~ .,
+  data = df_trees_balanced,
+  method = "class",
+  parms = list(split = "information"),
+  control = rpart.control(
+    cp = best_cp,
+    minsplit = 50,      # lower to allow finer splits
+    minbucket = 25,     
+    maxdepth = 20,       # a bit deeper than Tree 4
+    xval = 10
+  )
+)
+TREE_5_pruned <- prune(TREE_5, cp = best_cp)
+
+
+
+```
+
+## optimizing threshold for best F1 score
+```{r}
+
+Tree5_prob <- predict(TREE_5_pruned, df_trees_balanced, type = "prob")[,"Yes"]
+
+# Optimize F1 threshold
+thresholds <- seq(0.1, 0.9, by = 0.01)
+f1_scores <- sapply(thresholds, function(t) {
+  preds <- ifelse(Tree5_prob > t, "Yes", "No")
+  MLmetrics::F1_Score(y_pred = preds, y_true = df_trees_balanced$loan_default, positive = "Yes")
+})
+best_thresh <- thresholds[which.max(f1_scores)]
+best_f1 <- max(f1_scores)
+cat(sprintf("Best F1 threshold: %.3f | Max F1: %.3f\n", best_thresh, best_f1))
+
+
+Tree5_prob <- predict(TREE_5_pruned, holdout_trees, type = "prob")[,"Yes"]
+Tree5_class <- ifelse(Tree5_prob > best_thresh, "Yes", "No")
+
+tree_preds$Tree5_class = Tree5_class
+tree_preds$Tree5_prob = Tree5_prob
+
+Tree5_train_pred = predict(TREE_5_pruned,
+                    df_trees_balanced,
+                    type = "class")
+Tree5_hold_pred = predict(TREE_5_pruned,
+                    holdout_trees,
+                    type = "class")
+confusionMatrix(Tree5_train_pred,
+                df_trees_balanced$loan_default,
+                positive = "Yes") 
+confusionMatrix(Tree5_hold_pred,
+                holdout_trees$loan_default,
+                positive = "Yes") 
+
+```
+
+Optimal threshold at .38
+
+Opted to decrease controls even smaller to make even larger trees, trees with too few splits have been almost exclusively using dates (last pull, issue date). 76% overall accuracy, 77% recall, and still about 38% detection rate (.3846 -- highest yet). .748 Overall accuracy on holdout data (best yet)
+
+
+# TREE 6 -- Optimizing Tree4 using caret + f1 optimized thresholds
+going back to using the unbalanced data just to see if these better models work better with the unbalanced data set
+
+```{r}
+
+set.seed(123)
+CV6_TREE <- rpart::rpart(
+  loan_default ~ .,
+  data = df_trees_balanced,
+  method = "class",
+  parms = list(split = "information"),   # use information gain
+  control = rpart::rpart.control(
+    cp = 0.0002,
+    xval = 10,
+    minsplit = 200,
+    minbucket = 100,
+    maxdepth = 10
+  )
+)
+
+# Review complexity table and select optimal cp
+printcp(CV6_TREE)
+plotcp(CV6_TREE)
+
+best_cp6 <- CV6_TREE$cptable[which.min(CV6_TREE$cptable[, "xerror"]), "CP"]
+print(best_cp6)
+```
+## Plotting and Pruning
+```{r}
+TREE_6 <- prune(CV6_TREE, cp = best_cp6)
+options(scipen = 999)
+rpart.plot::rpart.plot(TREE_6, extra = 1, fallen.leaves = TRUE)
+```
+```{r}
+# --- Step 3: Get predicted probabilities for holdout sample ---
+Tree6_probs <- predict(TREE_6, holdout_trees, type = "prob")[, "Yes"]
+
+# --- Step 4: Function to compute F1 across thresholds ---
+find_best_f1 <- function(probs, actuals, positive = "Yes") {
+  thresholds <- seq(0.1, 0.9, by = 0.01)
+  
+  f1s <- sapply(thresholds, function(th) {
+    preds <- factor(ifelse(probs > th, "Yes", "No"), levels = c("No", "Yes"))
+    cm <- confusionMatrix(preds, actuals, positive = positive)
+    prec <- cm$byClass["Pos Pred Value"]
+    rec <- cm$byClass["Sensitivity"]
+    if (is.na(prec) | is.na(rec) | (prec + rec == 0)) return(0)
+    2 * prec * rec / (prec + rec)
+  })
+  
+  best_th <- thresholds[which.max(f1s)]
+  best_f1 <- max(f1s)
+  
+  cat("Best Threshold:", round(best_th, 2), "| F1:", round(best_f1, 4), "\n")
+  
+  return(list(threshold = best_th, f1 = best_f1))
+}
+```
+
+```{r}
+best_T6 <- find_best_f1(Tree6_probs, holdout_trees$loan_default)
+best_threshold <- best_T6$threshold
+
+# --- Step 6: Apply optimal threshold ---
+tree_preds$Tree6_class <- factor(ifelse(Tree6_probs > best_threshold, "Yes", "No"),
+                               levels = c("No", "Yes"))
+tree_preds$Tree6_prob  <- Tree6_probs
+
+
+Tree6_train_pred = predict(TREE_6,
+                    df_trees_balanced,
+                    type = "class")
+Tree6_hold_pred = predict(TREE_6,
+                    holdout_trees,
+                    type = "class")
+
+confusionMatrix(Tree6_train_pred,
+                df_trees_balanced$loan_default,
+                positive = "Yes") 
+confusionMatrix(Tree6_hold_pred,
+                holdout_trees$loan_default,
+                positive = "Yes") 
+
+```
+.64 chosen as the optimal threshold. Similar performance to other models 76% overall accuracy, .76 sensitivity, slightly lower detection rate. Best overall accuracy on holdout predictions, but also the lowest sensitivity
+
+
+# ROC Curve
+```{r}
+# saving prediction data frame
+saveRDS(tree_preds, "tree_preds.rds")
+
+pred_Tree1 = ROCR::prediction(tree_preds$Tree1_prob,
+                             tree_preds$Actuals)
+roc_Tree1 = ROCR::performance(pred_Tree1,"tpr", "fpr")
+
+
+pred_Tree2 = ROCR::prediction(tree_preds$Tree2_prob,
+                             tree_preds$Actuals)
+roc_Tree2 = ROCR::performance(pred_Tree2,"tpr", "fpr")
+
+
+pred_Tree3 = ROCR::prediction(tree_preds$Tree3_prob,
+                              tree_preds$Actuals)
+roc_Tree3 = ROCR::performance(pred_Tree3,"tpr", "fpr")
+
+
+pred_Tree4 = ROCR::prediction(tree_preds$Tree4_prob,
+                              tree_preds$Actuals)
+roc_Tree4 = ROCR::performance(pred_Tree4,"tpr", "fpr")
+
+pred_Tree5 = ROCR::prediction(tree_preds$Tree5_prob,
+                              tree_preds$Actuals)
+roc_Tree5 = ROCR::performance(pred_Tree5,"tpr", "fpr")
+
+pred_Tree6 = ROCR::prediction(tree_preds$Tree6_prob,
+                              tree_preds$Actuals)
+roc_Tree6 = ROCR::performance(pred_Tree6,"tpr", "fpr")
+
+plot(roc_Tree1, col = "blue", lwd = 2 , main = "ROC Curves")
+plot(roc_Tree2, col = "green", lwd = 2, add = TRUE)
+plot(roc_Tree3, col = "orange", lwd = 2,  add = TRUE)
+plot(roc_Tree4, col = "cyan", lwd = 2,  add = TRUE)
+plot(roc_Tree5, col = "purple", lwd = 2,  add = TRUE)
+plot(roc_Tree6, col = "yellow", lwd = 2,  add = TRUE)
+
+abline(a = 0, b = 1, col = "red", lty = 2, lwd = 2)
+
+```
+Hard to say which is the best based off of ROC curve. Model 4,5,6 are all very similar 
+
+## COMPARING AUC
+```{r}
+
+roc_Tree1_auc  <- ROCR::performance(pred_Tree1, 'auc')@y.values[[1]]
+roc_Tree2_auc <- ROCR::performance(pred_Tree2, 'auc')@y.values[[1]]
+roc_Tree3_auc <- ROCR::performance(pred_Tree3, 'auc')@y.values[[1]]
+roc_Tree4_auc <- ROCR::performance(pred_Tree4, 'auc')@y.values[[1]]
+roc_Tree5_auc <- ROCR::performance(pred_Tree5, 'auc')@y.values[[1]]
+roc_Tree6_auc <- ROCR::performance(pred_Tree6, 'auc')@y.values[[1]]
+
+cat("\nAUC Comparison:\n",
+    sprintf("Tree 1: %.4f\n", roc_Tree1_auc),
+    sprintf("Tree 2:    %.4f\n", roc_Tree2_auc),
+    sprintf("Tree 3:    %.4f\n", roc_Tree3_auc),
+    sprintf("Tree 4:    %.4f\n", roc_Tree4_auc),
+    sprintf("Tree 5:    %.4f\n", roc_Tree5_auc),
+    sprintf("Tree 6:    %.4f\n", roc_Tree6_auc)
+)
+
+```
+
+Tree 6 Has the best AUC, but not my much. Tree 3,4,5,6 are all very close 
+
+
+# Computing Lift 
+
+```{r}
+
+lift_Tree1 = ROCR::performance(pred_Tree1,"lift", "rpp")
+lift_Tree2 = ROCR::performance(pred_Tree2,"lift", "rpp")
+lift_Tree3 = ROCR::performance(pred_Tree3,"lift", "rpp")
+lift_Tree4 = ROCR::performance(pred_Tree4,"lift", "rpp")
+lift_Tree5 = ROCR::performance(pred_Tree5,"lift", "rpp")
+lift_Tree6 = ROCR::performance(pred_Tree6,"lift", "rpp")
+
+
+plot(lift_Tree1, main = "Lift Chart (unbalanced)", col="blue")
+plot(lift_Tree2, add= TRUE, col="green")
+
+plot(lift_Tree3, main = "Lift Chart (balanced)", col="orange")
+plot(lift_Tree4, add= TRUE, col="cyan")
+plot(lift_Tree5, add= TRUE, col="purple")
+plot(lift_Tree6, add= TRUE, col="yellow")
+
+```
+
+They are all very similar. Tree 5 takes a sharp jump up to the other 3 models. I believe this might indicate that this model is predicting high probabilities for loans that actually did default, which would be a serious problem. Tree 5 might not be the best choice 
+
+# Comparing F1
+```{r}
+
+f1_from_cm <- function(pred, actual) {
+  cm <- confusionMatrix(factor(pred, levels=c("No","Yes")),
+                        factor(actual, levels=c("No","Yes")),
+                        positive="Yes")
+  precision <- cm$byClass["Pos Pred Value"]
+  recall <- cm$byClass["Sensitivity"]
+  2 * ((precision * recall) / (precision + recall))
+}
+
+f1_Tree2 <- f1_from_cm(tree_preds$Tree2_class, tree_preds$Actuals)
+f1_Tree3 <- f1_from_cm(tree_preds$Tree3_class, tree_preds$Actuals)
+f1_Tree4 <- f1_from_cm(tree_preds$Tree4_class, tree_preds$Actuals)
+f1_Tree5 <- f1_from_cm(tree_preds$Tree5_class, tree_preds$Actuals)
+f1_Tree1  <- f1_from_cm(tree_preds$Tree1_class,  tree_preds$Actuals)
+f1_Tree6  <- f1_from_cm(tree_preds$Tree6_class,  tree_preds$Actuals)
+
+
+
+data.frame(Model=c("Tree1","Tree2","Tree3","Tree4","Tree5", "Tree6"),
+           F1=c(f1_Tree1,f1_Tree2,f1_Tree3,f1_Tree4,f1_Tree5,f1_Tree6))
+
+```
+
+Tree 6 has the best F1 score. .55 is not a great F1. We will look to improve with Random Forest and boosted trees
+
+While Tree 6 has the best F1, i am not convinced it is the best model. Tree 4 misclassified fewer "No"'s as "Yes"'s than Tree 6, had a better sensitivity than Tree 6, and a marginally different AUC compared to Tree 6.
+
+## Saving The Best Tree
+```{r}
+
+saveRDS(TREE_4, "best_tree.rds")
+
+
+```
+

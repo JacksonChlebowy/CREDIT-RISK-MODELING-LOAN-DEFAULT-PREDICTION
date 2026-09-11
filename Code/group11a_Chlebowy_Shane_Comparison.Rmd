@@ -1,0 +1,147 @@
+---
+title: "group11a_Chlebowy_Shane_final_comparison"
+output: html_document
+date: "2025-11-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Loading the Models
+```{r}
+library(caret)
+library(dplyr)
+library(MLmetrics)
+library(ROCR)
+library(ggplot2)
+library(pROC)
+library(parallel)
+library(doParallel)
+library(tidyr)
+
+# Load best models
+best_tree <- readRDS("best_tree.rds")
+best_xgb  <- readRDS("best_xgb.rds")
+best_rf   <- readRDS("best_random_forest.rds")
+
+# Load predictions data frame (contains Actuals, _prob, _class for each model)
+tree_preds <- readRDS("tree_preds.rds")
+holdout_trees = readRDS("holdout_trees.rds")
+df_trees_balanced = readRDS("df_trees_balanced.rds")
+
+holdout_trees$home_ownership <- as.character(holdout_trees$home_ownership)
+holdout_trees$home_ownership[holdout_trees$home_ownership == "ANY"] <- "OTHER"
+holdout_trees$home_ownership <- factor(holdout_trees$home_ownership)
+
+
+# Make predictions
+tree_preds$rf_class <- predict(best_rf, holdout_trees, type = "class")
+tree_preds$rf_prob  <- predict(best_rf, holdout_trees, type = "prob")[, "Yes"]
+
+```
+
+
+# comparing F1
+```{r}
+get_manual_metrics <- function(pred_class, pred_prob, actual, model_name) {
+cm <- confusionMatrix(
+factor(pred_class, levels = c("No", "Yes")),
+factor(actual, levels = c("No", "Yes")),
+positive = "Yes"
+)
+
+F1_val <- MLmetrics::F1_Score(y_pred = as.character(pred_class),
+y_true = as.character(actual),
+positive = "Yes")
+AUC_val <- pROC::auc(ifelse(actual == "Yes", 1, 0),
+as.numeric(pred_prob),
+direction = "<")
+
+data.frame(
+Model = model_name,
+Accuracy = round(cm$overall["Accuracy"], 4),
+Recall = round(cm$byClass["Sensitivity"], 4),
+Precision = round(cm$byClass["Pos Pred Value"], 4),
+F1 = round(F1_val, 4),
+Balanced_Accuracy = round(cm$byClass["Balanced Accuracy"], 4),
+Detection_Rate = round(cm$byClass["Detection Rate"], 4),
+AUC = round(as.numeric(AUC_val), 4)
+)
+}
+
+metrics_tree <- get_manual_metrics(tree_preds$Tree4_class, tree_preds$Tree4_prob, tree_preds$Actuals, "Decision Tree")
+metrics_rf   <- get_manual_metrics(tree_preds$rf_class,   tree_preds$rf_prob,   tree_preds$Actuals, "Random Forest")
+metrics_xgb  <- get_manual_metrics(tree_preds$xgb6_class,  tree_preds$xgb6_prob,  tree_preds$Actuals, "XGBoost")
+
+model_comparison <- rbind(metrics_tree, metrics_rf, metrics_xgb) 
+model_comparison
+
+
+
+```
+
+
+# comparing ROC
+```{r}
+pred_Tree = ROCR::prediction(tree_preds$Tree4_prob,
+                              tree_preds$Actuals)
+roc_Tree = ROCR::performance(pred_Tree,"tpr", "fpr")
+
+pred_rf = ROCR::prediction(tree_preds$rf_prob,
+                            tree_preds$Actuals)
+roc_rf = ROCR::performance(pred_rf,"tpr", "fpr")
+
+pred_xgb = ROCR::prediction(tree_preds$xgb6_prob,
+                            tree_preds$Actuals)
+roc_xgb = ROCR::performance(pred_xgb,"tpr", "fpr")
+
+
+plot(roc_Tree, col = "blue", lwd = 2 , main = "ROC Curves")
+plot(roc_rf, col = "green", lwd = 2 , add = TRUE)
+plot(roc_xgb, col = "orange", lwd = 2 , add = TRUE)
+
+abline(a = 0, b = 1, col = "red", lty = 2, lwd = 2)
+
+```
+
+# Comparing AUC
+```{r}
+auc_tree <- ROCR::performance(pred_Tree, "auc")@y.values[[1]]
+auc_rf <- ROCR::performance(pred_rf, "auc")@y.values[[1]]
+auc_xgb <- ROCR::performance(pred_xgb, "auc")@y.values[[1]]
+
+cat("\nAUC Comparison:\n",
+sprintf("Decision Tree: %.4f\n", auc_tree),
+sprintf("Random Forest: %.4f\n", auc_rf),
+sprintf("XGBoost: %.4f\n", auc_xgb))
+
+```
+
+```{r}
+metrics_long <- model_comparison %>%
+select(Model, F1, AUC, Accuracy, Recall, Precision) %>%
+pivot_longer(-Model, names_to = "Metric", values_to = "Value")
+
+ggplot(metrics_long, aes(x = Metric, y = Value, fill = Model)) +
+geom_bar(stat = "identity", position = "dodge") +
+geom_text(aes(label = round(Value, 3)), position = position_dodge(width = 0.9), vjust = -0.4, size = 3.5) +
+scale_fill_manual(values = c("blue", "darkgreen", "orange")) +
+labs(title = "Model Comparison – Performance Metrics", y = "Score", x = "") +
+theme_minimal(base_size = 13)
+
+
+
+```
+
+# Final Conclusion
+
+
+
+
+
+
+
+
+

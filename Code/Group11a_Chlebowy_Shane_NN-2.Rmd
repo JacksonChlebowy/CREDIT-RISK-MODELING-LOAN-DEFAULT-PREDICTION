@@ -1,0 +1,708 @@
+---
+title: "Group11a_Chlebowy_Shane_NN"
+output: html_document
+date: "2025-12-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading Packages
+```{r}
+library(dplyr)
+library(caret)
+library(parallel)
+library(doParallel)
+library(pROC)
+library(MLmetrics)
+library(ROCR)
+library(recipes)
+library(ranger)
+
+df_flags_2nd_run = readRDS("df_flags_2nd_run.rds")
+holdout = readRDS("holdout.rds")
+
+```
+
+
+# Checking RF varimporatce to reduce variables
+## Going to keep the top 15
+```{r}
+rf = readRDS('best_random_forest.rds')
+
+varImp(rf)
+```
+
+
+
+
+
+
+# Preprocessing the data 
+```{r}
+# limiting to top 15 by RF varImp
+df_flags_2nd_run = df_flags_2nd_run %>% select(loan_default, int_rate, issue_date_year, last_credit_pull_year, dti_cap38, loan_to_income_ratio_cap, revol_util_cap100, credit_age_months, revol_bal_cap100k, grade, fico_avg, loan_amnt, annual_inc_cap, total_acc_cap60, open_acc_cap25, emp_occupation)
+
+# recipe
+rec <- recipe(loan_default ~ ., data = df_flags_2nd_run) %>%
+  step_range(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), one_hot = FALSE)
+
+prep_train <- prep(rec)
+train_prepped <- bake(prep_train, new_data = NULL)
+train_prepped
+test_prepped <- bake(prep_train, new_data = holdout)
+
+
+train_prepped = train_prepped %>% mutate(
+  loan_default = factor(loan_default, levels = c("Yes","No"))
+)
+
+test_prepped = test_prepped %>% mutate(
+  loan_default = factor(loan_default, levels = c("Yes","No"))
+)
+
+table(train_prepped$loan_default)
+table(test_prepped$loan_default) # POSITIVE CLASSES ARE FIRST !!
+```
+
+```{r}
+#cores = parallel::detectCores()
+#cores
+#cl = parallel::makeCluster(cores-1)
+#registerDoParallel(cl)
+
+#set.seed(123)
+
+#tuneGrid = expand.grid(
+#  size = seq(8,10, by = 1),
+#  decay = seq(.3,.7, by = .1)    # Regularization strength
+#)
+
+#trControl = trainControl(
+#  method = "cv",
+#  number = 5,
+#  classProbs = TRUE,
+#  summaryFunction = twoClassSummary
+#)
+#nn=train(loan_default ~ .,
+#                 data = train_prepped,
+#                  method = "nnet",
+#                  trControl= trControl,
+#                  metric="ROC",
+#                  linout = FALSE,
+#                  trace = FALSE,
+#                  tuneGrid = tuneGrid)
+#nn
+
+#saveRDS(nn, "nn_model1.rds")
+
+#stopCluster(cl)
+#registerDoSEQ()
+
+```
+After running a basic grid ( sizes 0-10, and decay 0-1), best tune was size 9, decay .4
+
+2nd fit using grid (size 8,9,10 and Decay .3-.6) -- Model best params were size = 10 and decay = 0.7
+I will test a wider set of params in my next test to narrow down where performance is best, since results varied after shrinking grid
+
+- Sizes 5, 10, 15, 20
+- Decay .1, .3, .5, .7 
+
+
+## Making Predictions
+### f1 optimized predictions
+
+```{r}
+nn = readRDS("nn_model1.rds")
+
+# Creating Prediction Df
+nn_predictions = data.frame(
+  Actuals = test_prepped$loan_default)
+
+# model class and probability predictions
+nn1_class = predict(nn,newdata=test_prepped,type="raw")
+nn_predictions$nn1_prob = predict(nn, newdata = test_prepped, type = "prob")[, "Yes"]
+
+# computing F1
+pred = prediction(nn_predictions$nn1_prob, test_prepped$loan_default)
+
+prec = ROCR::performance(pred, "prec")
+rec  = ROCR::performance(pred, "rec")
+
+precision = prec@y.values[[1]]
+recall    = rec@y.values[[1]]
+
+# Compute F1 for each threshold
+f1 = 2 * precision * recall / (precision + recall)
+f1[is.nan(f1)] = 0
+
+
+# combining F1 scores and cuttofs into df
+cutoffs = prec@x.values[[1]]
+df_f1 = data.frame(f1,cutoffs)
+head(df_f1)
+
+# extracting best f1
+opt_idx = which.max(df_f1$f1)
+opt_f1  = df_f1[opt_idx, ]
+opt_f1 # best thresh is .2601289
+
+best_thresh = opt_f1$cutoffs
+
+# making best F1 prediction and adding to pred df
+nn_predictions$nn1_class = ifelse(nn_predictions$nn1_prob >= best_thresh, "Yes", "No")
+nn_predictions$nn1_class  = factor(nn_predictions$nn1_class, levels = c("Yes", "No"))
+
+
+
+confusionMatrix(nn_predictions$nn1_class,test_prepped$loan_default ,positive="Yes")
+
+```
+
+
+## ROC Curve
+```{r}
+
+probabilities=predict(nn,newdata=test_prepped,type="prob")
+probabilities$actual=test_prepped$loan_default
+
+# Create Prediction Object 
+pred = prediction(probabilities[,"Yes"], test_prepped$loan_default
+                  )
+# Create Performance Object
+model1_perf = performance(pred, "tpr", "fpr")
+auc = performance(pred,"auc")
+auc_value=auc@y.values[[1]]
+
+# Plot the ROC curve
+plot(model1_perf, col = "blue", lwd = 2, main = "ROC Curve")
+abline(a=0, b=1, col="red", lty=2)
+legend("bottomright",legend=paste("AUC = ",round(auc_value,3)),col="blue",lwd=2)
+```
+
+
+
+## NN 2
+```{r}
+#cores = parallel::detectCores()
+#cores
+#cl = parallel::makeCluster(cores-1)
+#registerDoParallel(cl)
+
+#set.seed(123)
+
+#tuneGrid = expand.grid(
+#  size = c(12),
+#  decay = c(.15)
+#)
+
+
+#trControl = trainControl(
+#  method = "cv",
+#  number = 5, # switch back to 5 after test 
+#  classProbs = TRUE,
+#  summaryFunction = twoClassSummary
+#)
+#nn2=train(loan_default ~ .,
+#                 data = train_prepped,
+#                  method = "nnet",
+#                  trControl= trControl,
+#                  metric="ROC",
+#                  linout = FALSE,
+#                  trace = FALSE,
+#                  maxit = 300,
+#                  tuneGrid = tuneGrid)
+#nn2
+#nn2$bestTune
+
+
+#saveRDS(nn2, "nn_model2.rds")
+
+
+#stopCluster(cl)
+#registerDoSEQ()
+
+
+```
+First run (Size 5, 10, 15, Decay .1, .3, .5, .7) best Size = 10 and Decay = .3
+
+Rerunning testing 8, 10, 12, and decays .2 - .5 by .05 ( previous best decay of .4, so testing in that range) 
+
+Next best fit was 10 and .2 but best sensitivity occurred at 12 deay .3 -- Tuning again 10, 11, 12, 13 and decays .15 - .35 by .05
+
+Fitting the best possible fit 
+
+
+
+## Making Predictions
+
+```{r}
+nn2 = readRDS('nn_model2.rds')
+
+# model class and probability predictions
+nn_predictions$nn2_prob = predict(nn2, newdata = test_prepped, type = "prob")[, "Yes"]
+
+# computing F1
+model2_pred = prediction(nn_predictions$nn2_prob, test_prepped$loan_default)
+
+prec = ROCR::performance(model2_pred, "prec")
+rec  = ROCR::performance(model2_pred, "rec")
+
+precision = prec@y.values[[1]]
+recall    = rec@y.values[[1]]
+
+# Compute F1 for each threshold
+f1 = 2 * precision * recall / (precision + recall)
+f1[is.nan(f1)] = 0
+
+
+# combining F1 scores and cuttofs into df
+cutoffs = prec@x.values[[1]]
+df_f1 = data.frame(f1,cutoffs)
+head(df_f1)
+
+# extracting best f1
+opt_idx = which.max(df_f1$f1)
+opt_f1  = df_f1[opt_idx, ]
+opt_f1 # best thresh is .2601289
+
+best_thresh = opt_f1$cutoffs
+
+# making best F1 prediction and adding to pred df
+nn_predictions$nn2_class = ifelse(nn_predictions$nn2_prob >= best_thresh, "Yes", "No")
+nn_predictions$nn2_class  = factor(nn_predictions$nn2_class, levels = c("Yes", "No"))
+
+
+
+confusionMatrix(nn_predictions$nn2_class,test_prepped$loan_default ,positive="Yes")
+
+```
+
+
+## ROC Curve
+```{r}
+
+probabilities=predict(nn2,newdata=test_prepped,type="prob")
+probabilities$actual=test_prepped$loan_default
+
+# Create Prediction Object 
+pred = prediction(probabilities[,"Yes"], test_prepped$loan_default
+                  )
+# Create Performance Object
+model2_perf = performance(pred, "tpr", "fpr")
+auc = performance(pred,"auc")
+auc_value=auc@y.values[[1]]
+
+# Plot the ROC curve
+plot(model2_perf, col = "blue", lwd = 2, main = "ROC Curve")
+abline(a=0, b=1, col="red", lty=2)
+legend("bottomright",legend=paste("AUC = ",round(auc_value,3)),col="blue",lwd=2)
+```
+```{r}
+#install.packages('keras')
+```
+
+## Attempting a Keras NN
+### Using ChatGPT to help fit a Keras NN
+```{r}
+# =====================================================================
+# FULL WORKING KERAS NEURAL NETWORK SCRIPT WITH TUNING LOOP (WITH DROPOUT)
+# =====================================================================
+
+library(keras)
+library(pROC)
+
+# -----------------------------
+# 1. Prepare Data
+# -----------------------------
+x <- as.matrix(train_prepped[, -which(names(train_prepped) == "loan_default")])
+y <- ifelse(train_prepped$loan_default == "Yes", 1, 0)
+
+set.seed(123)
+
+x_train <- as.matrix(train_prepped[, -which(names(train_prepped) == "loan_default")])
+y_train <- ifelse(train_prepped$loan_default == "Yes", 1, 0)
+
+x_test  <- as.matrix(test_prepped[, -which(names(test_prepped) == "loan_default")])
+y_test  <- ifelse(test_prepped$loan_default == "Yes", 1, 0)
+
+
+# -----------------------------
+# 2. Hyperparameter Grid
+# -----------------------------
+units1_list <- c(16, 24, 32)
+units2_list <- c(8, 12, 16, 24)
+decay_list <- c(1e-05, 1e-04, 5e-04, 1e-03)
+dropout_list <- c(0.1, 0.2, 0.3) # each node has a 90% chance to stay active, 80% chance, 70% chance
+
+results <- data.frame(
+  units1 = numeric(),
+  units2 = numeric(),
+  decay = numeric(),
+  dropout = numeric(),
+  auc = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# -----------------------------
+# 3. Tuning Loop
+# -----------------------------
+for (u1 in units1_list) {
+  for (u2 in units2_list) {
+    for (d in decay_list) {
+      for (dr in dropout_list) {
+
+        cat("Testing: units1 =", u1, ", units2 =", u2, ", decay =", d, ", dropout =", dr, "\n")
+
+        # Build model WITH DROPOUT
+        model <- keras_model_sequential() %>%
+          layer_dense(
+            units = u1,
+            activation = "relu",
+            input_shape = ncol(x_train),
+            kernel_regularizer = regularizer_l2(d)
+          ) %>%
+          layer_dropout(rate = dr) %>%                           # <---- ADDED DROP OUT
+
+          layer_dense(
+            units = u2,
+            activation = "relu",
+            kernel_regularizer = regularizer_l2(d)
+          ) %>%
+          layer_dropout(rate = dr) %>%                           # <---- ADDED DROP OUT
+
+          layer_dense(units = 1, activation = "sigmoid")
+
+        model %>% compile(
+          optimizer = optimizer_adam(0.001),
+          loss = "binary_crossentropy",
+          metrics = "accuracy"
+        )
+
+        model %>% fit(
+          x_train, y_train,
+          epochs = 8,
+          batch_size = 256,
+          verbose = 0,
+          validation_split = 0.2
+        )
+
+        pred_prob <- as.numeric(model %>% predict(x_test))
+        auc_val <- auc(y_test, pred_prob)
+
+        results <- rbind(
+          results,
+          data.frame(units1 = u1, units2 = u2, decay = d, dropout = dr, auc = auc_val)
+        )
+      }
+    }
+  }
+}
+
+# -----------------------------
+# 4. Pick Best Model Based on AUC
+# -----------------------------
+best_row <- results[which.max(results$auc), ]
+print(best_row)
+
+best_u1 <- best_row$units1
+best_u2 <- best_row$units2
+best_decay <- best_row$decay
+best_dropout <- best_row$dropout
+
+cat("\nRetraining best model with units1 =", best_u1,
+    "units2 =", best_u2,
+    "decay =", best_decay,
+    "dropout =", best_dropout, "\n")
+
+# -----------------------------
+# 5. Retrain Best Model Properly (WITH DROPOUT)
+# -----------------------------
+best_model <- keras_model_sequential() %>%
+  layer_dense(
+    units = best_u1,
+    activation = "relu",
+    input_shape = ncol(x_train),
+    kernel_regularizer = regularizer_l2(best_decay)
+  ) %>%
+  layer_dropout(rate = best_dropout) %>%                         # <---- ADDED DROP OUT
+
+  layer_dense(
+    units = best_u2,
+    activation = "relu",
+    kernel_regularizer = regularizer_l2(best_decay)
+  ) %>%
+  layer_dropout(rate = best_dropout) %>%                         # <---- ADDED DROP OUT
+
+  layer_dense(units = 1, activation = "sigmoid")
+
+best_model %>% compile(
+  optimizer = optimizer_adam(0.001),
+  loss = "binary_crossentropy",
+  metrics = c("accuracy", metric_auc())
+)
+
+history <- best_model %>% fit(
+  x_train, y_train,
+  epochs = 25,
+  batch_size = 64,
+  validation_split = 0.2,
+  callbacks = callback_early_stopping(patience = 3, restore_best_weights = TRUE)
+)
+
+# -----------------------------
+# 6. Evaluate Final Model
+# -----------------------------
+evaluation <- best_model %>% evaluate(x_test, y_test)
+print(evaluation)
+
+# -----------------------------
+# 7. Predict Using Optimal F1 Threshold
+# -----------------------------
+
+nn_predictions$pred_prob <- as.numeric(best_model %>% predict(x_test))
+
+thresholds <- seq(0, 1, by = 0.01)
+
+f1_for_threshold <- function(t) {
+  pred_temp <- ifelse(pred_prob > t, 1, 0)
+
+  TP <- sum(pred_temp == 1 & y_test == 1)
+  FP <- sum(pred_temp == 1 & y_test == 0)
+  FN <- sum(pred_temp == 0 & y_test == 1)
+
+  precision <- ifelse((TP + FP) == 0, 0, TP / (TP + FP))
+  recall    <- ifelse((TP + FN) == 0, 0, TP / (TP + FN))
+
+  if (precision + recall == 0) return(0)
+  return(2 * precision * recall / (precision + recall))
+}
+
+f1_scores <- sapply(thresholds, f1_for_threshold)
+best_threshold <- thresholds[which.max(f1_scores)]
+
+cat("Best F1 threshold:", best_threshold, "\n")
+
+nn_predictions$pred_class <- ifelse(pred_prob > best_threshold, 1, 0)
+
+# Confusion Matrix
+TP <- sum(nn_predictions$pred_class == 1 & y_test == 1)
+FP <- sum(nn_predictions$pred_class == 1 & y_test == 0)
+TN <- sum(nn_predictions$pred_class == 0 & y_test == 0)
+FN <- sum(nn_predictions$pred_class == 0 & y_test == 1)
+
+conf_matrix <- matrix(c(TN, FP, FN, TP), nrow = 2, byrow = TRUE)
+colnames(conf_matrix) <- c("Pred 0", "Pred 1")
+rownames(conf_matrix) <- c("Actual 0", "Actual 1")
+
+cat("\nConfusion Matrix at Optimal F1 Threshold:\n")
+print(conf_matrix)
+
+# -----------------------------
+# 8. Compute Final F1 Score
+# -----------------------------
+final_precision <- TP / (TP + FP)
+final_recall    <- TP / (TP + FN)
+final_f1        <- 2 * final_precision * final_recall / (final_precision + final_recall)
+
+cat("\nFinal Precision:", round(final_precision, 4))
+cat("\nFinal Recall:", round(final_recall, 4))
+cat("\nFinal F1 Score:", round(final_f1, 4), "\n")
+
+
+
+# =====================================================================
+# END OF SCRIPT
+# =====================================================================
+
+saveRDS(best_model, "keras_nn.rds")
+
+```
+
+## ROC
+```{r}
+
+
+#install.packages("pROC")
+library(pROC)
+
+roc_obj <- roc(y_test, nn_predictions$pred_prob)
+auc_value <- auc(roc_obj)
+
+cat("AUC:", auc_value, "\n")
+
+plot(roc_obj, col = "blue", lwd = 2, main = "ROC Curve")
+abline(a = 1, b = -1, col = "red", lty = 2)
+
+```
+
+# NN 4
+
+```{r}
+cores = parallel::detectCores()
+cores
+cl = parallel::makeCluster(cores-1)
+registerDoParallel(cl)
+
+set.seed(123)
+
+cv_control=trainControl(
+  method="cv",
+  number=5,
+  classProbs = TRUE)
+
+grid=expand.grid(size=c(1,2), decay=c(0.05,0.15))
+
+
+nn4 <- train(
+  loan_default ~ .,
+  data=train_prepped,
+  method="nnet",
+  trControl = cv_control,
+  linout = FALSE,
+  trace = FALSE,
+  tuneGrid=grid,
+  maxit = 200,
+  metric = "ROC"
+)
+
+nn4
+nn4$bestTune
+
+
+saveRDS(nn4, "nn_model4.rds")
+
+
+stopCluster(cl)
+registerDoSEQ()
+
+
+```
+
+## Making Predictions
+
+```{r}
+##
+nn4 = readRDS('nn_model4.rds')
+
+
+# model class and probability predictions
+nn_predictions$nn4_prob = predict(nn4, newdata = test_prepped, type = "prob")[, "Yes"]
+
+# computing F1
+model4_pred = prediction(nn_predictions$nn4_prob, test_prepped$loan_default)
+
+prec = ROCR::performance(model4_pred, "prec")
+rec  = ROCR::performance(model4_pred, "rec")
+
+precision = prec@y.values[[1]]
+recall    = rec@y.values[[1]]
+
+# Compute F1 for each threshold
+f1 = 2 * precision * recall / (precision + recall)
+f1[is.nan(f1)] = 0
+
+
+# combining F1 scores and cuttofs into df
+cutoffs = prec@x.values[[1]]
+df_f1 = data.frame(f1,cutoffs)
+head(df_f1)
+
+# extracting best f1
+opt_idx = which.max(df_f1$f1)
+opt_f1  = df_f1[opt_idx, ]
+opt_f1 
+
+best_thresh = opt_f1$cutoffs
+
+# making best F1 prediction and adding to pred df
+nn_predictions$nn4_class = ifelse(nn_predictions$nn4_prob >= best_thresh, "Yes", "No")
+nn_predictions$nn4_class  = factor(nn_predictions$nn4_class, levels = c("Yes", "No"))
+
+
+
+confusionMatrix(nn_predictions$nn4_class,test_prepped$loan_default ,positive="Yes")
+
+```
+
+## ROC Curve
+```{r}
+
+probabilities=predict(nn4,newdata=test_prepped,type="prob")
+probabilities$actual=test_prepped$loan_default
+
+# Create Prediction Object 
+pred = prediction(probabilities[,"Yes"], test_prepped$loan_default
+                  )
+# Create Performance Object
+model4_perf = performance(pred, "tpr", "fpr")
+auc = performance(pred,"auc")
+auc_value=auc@y.values[[1]]
+
+# Plot the ROC curve
+plot(model4_perf, col = "blue", lwd = 2, main = "ROC Curve")
+abline(a=0, b=1, col="red", lty=2)
+legend("bottomright",legend=paste("AUC = ",round(auc_value,3)),col="blue",lwd=2)
+```
+
+# Comparing our models
+
+
+## ROC Comparison
+```{r}
+plot(model1_perf ,col = "blue", lwd = 2 , main = "ROC Curves")
+plot(model2_perf, col = "green", lwd = 2 , add = TRUE)
+#plot(model3_perf, col = "orange", lwd = 2 , add = TRUE)
+plot(model4_perf, col = "yellow", lwd = 2 , add = TRUE)
+
+
+
+abline(a = 0, b = 1, col = "red", lty = 2, lwd = 2)
+
+```
+
+## Comparing key Metrics
+```{r}
+get_manual_metrics <- function(pred_class, pred_prob, actual, model_name) {
+cm <- confusionMatrix(
+factor(pred_class, levels = c("No", "Yes")),
+factor(actual, levels = c("No", "Yes")),
+positive = "Yes"
+)
+
+F1_val <- MLmetrics::F1_Score(y_pred = as.character(pred_class),
+y_true = as.character(actual),
+positive = "Yes")
+AUC_val <- pROC::auc(ifelse(actual == "Yes", 1, 0),
+as.numeric(pred_prob),
+direction = "<")
+
+data.frame(
+Model = model_name,
+Accuracy = round(cm$overall["Accuracy"], 4),
+Recall = round(cm$byClass["Sensitivity"], 4),
+Precision = round(cm$byClass["Pos Pred Value"], 4),
+F1 = round(F1_val, 4),
+Balanced_Accuracy = round(cm$byClass["Balanced Accuracy"], 4),
+Detection_Rate = round(cm$byClass["Detection Rate"], 4),
+AUC = round(as.numeric(AUC_val), 4)
+)
+}
+
+metrics_model1 <- get_manual_metrics(nn_predictions$nn1_class, nn_predictions$nn1_prob, nn_predictions$Actuals, "model1")
+metrics_model2  <- get_manual_metrics(nn_predictions$nn2_class,   nn_predictions$nn2_prob,   nn_predictions$Actuals, "model2")
+metrics_model3  <- get_manual_metrics(nn_predictions$pred_class,  nn_predictions$pred_prob, nn_predictions$Actuals, "model3")
+metrics_model4  <- get_manual_metrics(nn_predictions$nn4_class,  nn_predictions$nn4_prob, nn_predictions$Actuals, "model4")
+
+model_comparison <- rbind(metrics_model1, metrics_model2, metrics_model3, metrics_model4) 
+model_comparison
+```
+Keras Model Results:
+Final Precision: 0.4524
+Final Recall: 0.614
+Final F1 Score: 0.521 
+
+Our best performing model was model2, with the highest recall (67%), highest F1 score (.556) and highest AUC (.8252). Model 2 outperforms all other models given our task of correctly identifying loan defaults. All of these models appear to perform similarly to our regularized regression models.
+

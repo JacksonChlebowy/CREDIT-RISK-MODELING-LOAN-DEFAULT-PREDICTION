@@ -1,0 +1,1142 @@
+---
+title: "group11a_Chlebowy_Shane_Log_reg"
+output: html_document
+date: "2025-11-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading data & packages
+```{r}
+
+library(dplyr)
+library(caret)
+library(parallel)
+library(doParallel)
+library(pROC)
+library(MLmetrics)
+library(ROCR)
+
+
+
+df_flags_2nd_run = readRDS("df_flags_2nd_run.rds")
+holdout = readRDS("holdout.rds")
+
+```
+
+## Adding interactions and features from previous modeling + Creating training Datasets
+To test these models, and our data, i am going to create 2 seperate train/test dfs. 1 with logged versions of variables, and 1 with capped/binned versions of variables. whichever performs better on initial testing will be what i move forward with. 
+```{r}
+# createing credit_age_bin Var
+
+train_log = df_flags_2nd_run %>%
+  mutate(credit_age_bin = case_when(
+    credit_age_months < 96 ~ "under8yrs",
+    credit_age_months < 180 ~ "8to15yrs",
+    TRUE ~ "15+"
+  )) %>%
+  mutate(credit_age_bin = factor(credit_age_bin,
+                                 levels = c("under8yrs","8to15yrs", "15+")))%>%
+  select(-credit_age_months)
+
+
+# createing credit_age_bin Var -- Holdout
+
+holdout_log = holdout %>%
+  mutate(credit_age_bin = case_when(
+    credit_age_months < 96 ~ "under8yrs",
+    credit_age_months < 180 ~ "8to15yrs",
+    TRUE ~ "15+"
+  )) %>%
+  mutate(credit_age_bin = factor(credit_age_bin,
+                                 levels = c("under8yrs","8to15yrs", "15+"))) %>%
+  select(-credit_age_months)
+
+
+# Adding Interaction Terms from previous models to train/holdout
+
+train_log = train_log %>%
+  mutate(
+    dti_log_income = dti_cap38 * log_annual_inc,
+    
+    revol_util_fico = revol_util_cap100 * fico_avg,
+
+    inq6_fico = as.numeric(inq_last_6mths_bin) * fico_avg,
+    loan_age = pmax(0, last_credit_pull_year - issue_date_year),
+    loan_age2 = loan_age^2
+  ) %>% select(-issue_date_year)
+
+holdout_log = holdout_log %>%
+  mutate(
+    dti_log_income = dti_cap38 * log_annual_inc,
+    
+    revol_util_fico = revol_util_cap100 * fico_avg,
+
+    inq6_fico = as.numeric(inq_last_6mths_bin) * fico_avg,
+    loan_age = pmax(0, last_credit_pull_year - issue_date_year),
+    loan_age2 = loan_age^2
+  ) %>% select(-issue_date_year)
+
+
+train_log = train_log %>% select(-last_delinq_bin, -annual_inc_cap, -revol_bal_cap100k, -total_acc_bin)
+holdout_log = holdout_log %>% select(-last_delinq_bin, -annual_inc_cap, -revol_bal_cap100k, -total_acc_bin)
+
+# Applying Same changes to train/holdout_binned
+train_binned = df_flags_2nd_run %>%
+  mutate(credit_age_bin = case_when(
+    credit_age_months < 96 ~ "under8yrs",
+    credit_age_months < 180 ~ "8to15yrs",
+    TRUE ~ "15+"
+  )) %>%
+  mutate(credit_age_bin = factor(credit_age_bin,
+                                 levels = c("under8yrs","8to15yrs", "15+")))%>%
+  select(-credit_age_months)
+
+
+
+holdout_binned = holdout %>%
+  mutate(credit_age_bin = case_when(
+    credit_age_months < 96 ~ "under8yrs",
+    credit_age_months < 180 ~ "8to15yrs",
+    TRUE ~ "15+"
+  )) %>%
+  mutate(credit_age_bin = factor(credit_age_bin,
+                                 levels = c("under8yrs","8to15yrs", "15+"))) %>%
+  select(-credit_age_months)
+
+
+train_binned = train_binned %>%
+  mutate(
+    dti_income = dti_cap38 * annual_inc_cap,
+    revol_util_fico = revol_util_cap100 * fico_avg,
+    inq6_fico = as.numeric(inq_last_6mths_bin) * fico_avg,
+    loan_age = pmax(0, last_credit_pull_year - issue_date_year),
+    loan_age2 = loan_age^2
+  ) %>% select(-issue_date_year)
+
+holdout_binned = holdout_binned %>%
+  mutate(
+    dti_income = dti_cap38 * annual_inc_cap,
+    revol_util_fico = revol_util_cap100 * fico_avg,
+    inq6_fico = as.numeric(inq_last_6mths_bin) * fico_avg,
+    loan_age = pmax(0, last_credit_pull_year - issue_date_year),
+    loan_age2 = loan_age^2
+  ) %>% select(-issue_date_year)
+
+
+
+train_binned = train_binned %>% select(-log_mths_since_last_delinq, -log_annual_inc, -log_revol_bal, -total_acc_cap60)
+
+holdout_binned = holdout_binned %>% select(-log_mths_since_last_delinq, -log_annual_inc, -log_revol_bal, -total_acc_cap60)
+```
+
+
+
+# Fitting Model 1 -- Logged vs Binned 
+
+## Taking a random sample first 
+i am going to random sample my data so these early models run quicker and i can find the best params
+```{r}
+
+set.seed(123)
+
+# random sample of 20% of the data 
+idx = createDataPartition(train_log$loan_default, p = 0.2, list = FALSE)
+
+train_log_sample = train_log[idx, ]
+train_binned_sample = train_binned[idx, ]
+
+table(train_log_sample$loan_default) # roughly 80/20 split, True to the full data proportions
+
+```
+
+
+
+
+
+```{r}
+
+cores = parallel::detectCores()
+cores
+cl = parallel::makeCluster(cores-1)
+registerDoParallel(cl)
+
+ctrl = trainControl(method = "cv", number = 10,
+                    summaryFunction = twoClassSummary,
+                    classProbs = TRUE,
+                    savePredictions = "final")
+
+set.seed(123)
+
+logit_fit_log = train(
+  loan_default ~.,
+  data = train_log_sample,
+  method = "glmnet",
+  trControl = ctrl,
+  tuneGrid = expand.grid(alpha =seq(0.1,.15, length = 10), lambda = 10^seq(-4, -1.3, length = 50)      # lambda = 0.0001 → 0.05 (log scale), using for quicker run time, is there a better lambda than 0?
+)
+)
+
+set.seed(123)
+logit_fit_binned = train(
+  loan_default ~.,
+  data = train_binned_sample,
+  method = "glmnet",
+  trControl = ctrl,
+  tuneGrid = expand.grid(alpha =seq(0.1,.15, length = 10), lambda = 10^seq(-4, -1.3, length = 50)   # lambda = 0.0001 → 0.05 (log scale), using for quicker run time, is there a better lambda than 0?
+))
+
+plot(logit_fit_log)
+plot(logit_fit_binned)
+
+logit_fit_log$bestTune
+logit_fit_binned$bestTune
+
+
+
+stopCluster(cl)
+registerDoSEQ()
+```
+After Round of Trial and Error I Have Found:
+
+- Lambda performs best at/around 0 - model is stable without much penalization
+- Alpha performs best in the range of .1 - .2
+- logged version appears slightly more stable compared to the binned
+- low alpha indicates the elastic net is more ridge dependent. Shrinking vars toward 0 rather than     eliminating them like lasso
+- very low lambda means very light penalties on var coefficients, higher lambdas resulted in dropping   ROC
+
+I am going to go ahead, and retrain the model with the full datasets and evaluate on the holdout from there 
+
+```{r}
+
+set.seed(123)
+logit_model1 = train(
+  loan_default ~.,
+  data = train_log,
+  method = "glmnet",
+  trControl = ctrl,
+  tuneGrid = expand.grid(alpha = 0.1444444		, lambda = 0.0002759411	 # best possible tune
+)
+)
+
+# checking coefficients -- ( I used ChatGPT to help make a nice sorted coef table)
+coefs = round(as.matrix(coef(logit_model1$finalModel,s = logit_model1$bestTune$lambda)), 3)
+coef_df = data.frame(variable = rownames(coefs), coef = coefs[, 1], row.names = NULL)
+coef_sorted = coef_df[order(-coef_df$coef), ]
+print(coef_sorted)
+
+# checking variables importance
+importance = varImp(logit_model1, scale = FALSE)
+plot(importance, top = 20)
+
+
+saveRDS(logit_model1, "logit_model1.rds")
+```
+The following Variables add the most risk of default:
+
+-Loan to income ratio
+- loan Grade
+- Occupation
+- home ownership type
+- mortgage accounts
+
+Coefficient Key Takeaways: 
+
+- There are a handful of Nearly 0 coefficient variables, meaning they contribute very little to predict the odds of default. These Variables might be candidates for removal, or further feature engineering
+
+- Some Surprising Results:
+  - Loan_amnt = 0.00 -- could be because of existing interaction with loan_amnt
+  - int_rate = 0.004 -- Not sure why this is of such low importance. My hypothesis is that this is     somehow captured in the Grade levels, since those vars are very important. 
+  - dti_log_income and raw dti var are both near 0 -- Very surprising considering how important they   were to previous tree based models
+  - Many of the interactions i created are close/near 0 -- they did not add anythign to the model. I will remove these near 0 features before rerunning 
+  - Many occupation vars clumped together at Negative values -- This indicates these are low risk      occupations. I could consider creating an occupation risk bin, with occupations like self,           hospitality, missingtitle, etc are High Risk, and low coef occupations are Low Risk
+
+
+# Evaluating on the holdout set
+```{r}
+# predicting probabilities
+log_preds = data.frame(Actuals = holdout_log$loan_default)
+
+log_preds$log1_probs = predict(logit_model1, newdata = holdout_log, type = "prob")[, "Yes"]
+
+# ROC/AUC
+roc_obj <- roc(response = holdout_log$loan_default,
+               predictor = as.vector(log_preds$log1_probs))
+
+auc_val <- auc(roc_obj)
+auc_val
+
+
+
+# optimizing predictions threshold on F1
+thresholds = seq(0.01, 0.99, by = 0.01)
+
+## Compute F1 for each threshold
+f1_scores = sapply(thresholds, function(th) {
+  log1_class <- ifelse(log_preds$log1_probs >= th, "Yes", "No")
+  F1_Score(y_pred = log1_class, y_true = holdout_log$loan_default, positive = "Yes")
+})
+
+## Find the threshold that maximizes F1
+best_thresh_f1 <- thresholds[which.max(f1_scores)]
+best_f1 <- max(f1_scores, na.rm = TRUE)
+
+cat("Best threshold (max F1):", round(best_thresh_f1, 3), "\n")
+cat("Best F1 Score:", round(best_f1, 3), "\n")
+
+
+log_preds$log1_class = factor(ifelse(log_preds$log1_probs >= .24, "Yes", "No"))
+
+
+confusionMatrix(log_preds$log1_class,
+                log_preds$Actuals,
+                positive = "Yes")
+```
+## Roc Curve
+```{r}
+model1_pred = prediction(log_preds$log1_prob, log_preds$Actuals)
+model1_perf = performance(model1_pred, "tpr", "fpr")
+
+plot(model1_perf, col = "blue", lwd = 2, main = "ROC curve")
+abline(a = 0, b = 1, col = "red", lty = 2, lwd = 2)
+
+```
+
+## Lift Chart
+```{r}
+lift1 = performance(model1_pred, "lift", "rpp")
+plot(lift1, main = "Lift Chart", col = 2)
+axis(1, at=seq(0,1, by = .1))
+legend(.6,4.8, legend = c("model1"),
+       col = "red", lty = 1, cex = .8)
+
+```
+Not the best first model but not the worst. Recall at 60%, detection rate is very low at .1169. The model is overpredicting the "Yes" class 
+
+Before making the improvements listed above to my data for future models, I am going to attempt a model using a downsampled data with even Yes/No proportions to see baseline performance. After this, I will make improvements to my data and retry Model 1 with improved data.
+
+# Model 2 -- Balanced dataset
+Downsampling the data to retrain the model on 50/50 split on loan_default. This should improve recall and hopefully improve F1. 
+
+I am again going to use the train_log instead of the binned versions of variables based off of earlier testing
+
+## Downsampling the data
+```{r}
+
+train_log_balanced = train_log %>%
+  group_by(loan_default) %>%
+  sample_n(size = min(table(train_log$loan_default))) %>%
+  ungroup()
+
+table(train_log_balanced$loan_default) # it is balanced
+
+
+```
+
+## First Run
+I am going to train a base model without making any changes to the data to see if any of the variables not important in the previous model become important again when trained on balanced data.
+
+```{r}
+# parallel processing
+cores = parallel::detectCores()
+cl = parallel::makeCluster(cores-1)
+registerDoParallel(cl)
+
+#train the model
+set.seed(123)
+
+logit_fit_balanced = train(
+  loan_default ~.,
+  data = train_log_balanced,
+  method = "glmnet",
+  trControl = ctrl, # 10 fold cv
+  tuneGrid = expand.grid(alpha = seq(0, 1, .25), lambda = seq(0, 1, length =10)),
+  metric = "ROC",
+  family = "binomial"
+)
+
+set.seed(123)
+
+logit_fit_balanced2 = train(
+  loan_default ~.,
+  data = train_log_balanced,
+  method = "glmnet",
+  trControl = ctrl, # 10 fold cv
+  tuneGrid = expand.grid(alpha =seq(0, .2, length = 10), lambda = seq(0, .2, length = 50)),
+  metric = "ROC",
+  family = "binomial"
+)
+
+set.seed(123)
+
+logit_fit_balanced3 = train(
+  loan_default ~.,
+  data = train_log_balanced,
+  method = "glmnet",
+  trControl = ctrl, # 10 fold cv
+  tuneGrid = expand.grid(alpha =seq(0.4,.6, length = 10), lambda = seq(0, .2, length = 50)),
+  metric = "ROC",
+  family = "binomial"
+)
+
+
+# plot + bestTune of model
+plot(logit_fit_balanced)
+plot(logit_fit_balanced2)
+plot(logit_fit_balanced3)
+
+
+
+logit_fit_balanced$bestTune
+logit_fit_balanced2$bestTune
+logit_fit_balanced3$bestTune
+
+
+
+stopCluster(cl)
+registerDoSEQ()
+
+```
+I ran initial base testing on the following grid: 
+ 
+alpha = seq(0, 1, .25), lambda = seq(0, 1, length =10)
+ 
+- My results were similar to the previous model. Alpha of 0 (ridge regression) performed the best, with every other alpha value decreased down to .50, while the ridge AUC never dipped below ~.74.
+Based on these results I am going to run a more aggressive grid, similar to the final grid of model 1 to get a more precise tune
+- Because the best tune was actually alpha 0.5 (despite it not being as stable) I am going to test around that alpha as well, just to see if there is a better model with an Alpha of .5
+
+After Fine Tuning and Exploring best possible AUC:
+- I can confirm that An Alpha close to 0 has higher AUC than Alpha of ~ .5. Alphas closer to 0 have higher AUC's and a slower drop off in AUC compared to more lasso-like models. 
+
+
+## Fitting besttune from balanced 2
+```{r}
+set.seed(123)
+
+logit_model2 = train(
+  loan_default ~.,
+  data = train_log_balanced,
+  method = "glmnet",
+  trControl = ctrl,
+  tuneGrid = expand.grid(alpha = 0.08888889		, lambda = 0	 # best possible tune
+),
+  metric = "ROC",
+  family = "binomial"
+)
+
+# checking coefficients -- ( I used ChatGPT to help make a nice sorted coef table)
+coefs = round(as.matrix(coef(logit_model2$finalModel,s = logit_model2$bestTune$lambda)), 3)
+coef_df = data.frame(variable = rownames(coefs), coef = coefs[, 1], row.names = NULL)
+coef_sorted = coef_df[order(-coef_df$coef), ]
+print(coef_sorted)
+
+# checking variables importance
+importance = varImp(logit_model2, scale = FALSE)
+plot(importance, top = 20)
+
+```
+These are very similar coefs and var imporances that i got from the unbalanced data. I will definitely have to make some changes to my data to improve this model further. For now i will evaluate on the holdout, and then make the necessary changes and compare results.
+
+## Predictions
+```{r}
+# Making Predictions
+
+log_preds$log2_probs = predict(logit_model2,
+                                 newdata = holdout_log,
+                                 type = "prob")[,"Yes"]
+
+
+
+# ROC/AUC
+roc_model2 <- roc(response = log_preds$Actuals,
+               predictor = as.vector(log_preds$log2_probs))
+
+auc_val <- auc(roc_model2)
+auc_val
+
+
+
+# optimizing predictions threshold on F1
+thresholds = seq(0.01, 0.99, by = 0.01)
+
+## Compute F1 for each threshold
+f1_scores = sapply(thresholds, function(th) {
+  log2_class <- ifelse(log_preds$log2_probs >= th, "Yes", "No")
+  F1_Score(y_pred = log2_class, y_true = log_preds$Actuals, positive = "Yes")
+})
+
+## Find the threshold that maximizes F1
+best_thresh_f1 <- thresholds[which.max(f1_scores)]
+best_f1 <- max(f1_scores, na.rm = TRUE)
+
+cat("Best threshold (max F1):", round(best_thresh_f1, 3), "\n")
+cat("Best F1 Score:", round(best_f1, 3), "\n")
+
+
+log_preds$log2_class = factor(ifelse(log_preds$log2_probs >= best_thresh_f1, "Yes", "No"))
+
+
+confusionMatrix(log_preds$log2_class,
+                log_preds$Actuals,
+                positive = "Yes")
+
+
+
+```
+
+
+## ROC Curve
+```{r}
+
+model2_pred = prediction(log_preds$log2_prob, log_preds$Actuals)
+model2_perf = performance(model2_pred, "tpr", "fpr")
+
+plot(model2_perf, col = "blue", lwd = 2, main = "ROC curve")
+abline(a = 0, b = 1, col = "red", lty = 2, lwd = 2)
+
+```
+
+## Lift Chart
+```{r}
+lift2 = performance(model2_pred, "lift", "rpp")
+plot(lift2, main = "Lift Chart", col = 2)
+axis(1, at=seq(0,1, by = .1))
+legend(.6,5, legend = c("model1"),
+       col = "red", lty = 1, cex = .8)
+
+```
+
+It appears running the model on balanced data made some improvements. Overall Accuracy has slightly decreased, but recall is up to 62%. Detection rate is also up at 12% compared to the base models 11%.
+There is still further room for improvement, by making some of the changes that i laid out previously, like cutting out vars that dont contribute to the model, and binning together occupations by risk contribution. I will make those changes now to the balanced dataset, retrain the model, and re-evaluate
+
+# Model 3
+
+## Cleaning up unimportant variable
+
+I am going to start by eliminating variables that have been shrunk to 0 or nearly 0. Any factor vars that have many levels contributing minimally, i will drop aswell. ( I am keeping anything >/< .05/-.05)
+
+```{r}
+print(coef_sorted)
+
+train_log_balanced = train_log_balanced %>% select(-emp_length, -open_acc_cap25, -open_acc_high, -term, -int_rate, -dti_cap38, -dti_log_income, -loan_amnt, -revol_util_fico, - inq6_fico, -inq_last_6mths_bin, -loan_age2, -loan_age, -total_acc_cap60, -fico_avg, -log_mths_since_last_delinq)
+
+# I am not really balancing the holdout, i just want to make sure i name it something different since i am chaning the variables in the df
+holdout_log_balance = holdout_log %>% select(-emp_length, -open_acc_cap25, -open_acc_high, -term, -int_rate, -dti_cap38, -dti_log_income, -loan_amnt, -revol_util_fico, - inq6_fico, -inq_last_6mths_bin, -loan_age2, -loan_age, -total_acc_cap60, -fico_avg, -log_mths_since_last_delinq)
+
+
+```
+
+## Binning occupations
+I am using ChatGPT to help me create a clean df with only the coefs of the emp_occupation variable so i can try to cluster occupations together into smaller risk groups. Because the coefs are all relative to the baseline, i am going to center the coefficients to find a true average, and then create the risk bins based on groupings and the centered odds ratio.
+
+```{r}
+# --- Extract only occupation-related coefficients ---
+occ_coefs <- coef_sorted[grepl("^emp_occupation", coef_sorted$variable), ]
+
+# --- Add Odds Ratio (raw, un-centered) ---
+occ_coefs$odds_ratio <- round(exp(occ_coefs$coef), 3)
+
+# --- Sort by coefficient (descending risk relative to baseline) ---
+occ_coefs <- occ_coefs[order(-occ_coefs$coef), ]
+
+# --- Round original coefficients for readability ---
+occ_coefs$coef <- round(occ_coefs$coef, 3)
+
+# --- Center coefficients around the mean (fixes baseline bias) --- I am doing this because the baseline is not a true "Medium Risk", i want to be able to try to identify which levels are the most risky, independent of the baseline. This makes 0 the average occupation risk / 1 the average odds ratio
+mean_coef <- mean(occ_coefs$coef)
+occ_coefs$coef_centered <- round(occ_coefs$coef - mean_coef, 3)
+
+# --- Centered odds ratio --- I am doing this because the baseline is not a true "Medium Risk", i want to be able to try to identify which levels are the most risky, independent of the baseline. This makes 0 the average occupation risk / 1 the average odds ratio
+
+occ_coefs$odds_ratio_centered <- round(exp(occ_coefs$coef_centered), 3)
+
+occ_coefs
+
+
+```
+Now i can see which occupations are the most/least risky and group them together:
+
+- I am going to group owner_self and hospitality as "Very High Risk", as they are both more than 40% more likely to default than the baseline (construction_realestate) and about 50-100% more likely than the average
+
+- I am going to group transport_logistics, missing_title, and sales_retail_cs as "High Risk" as they are all roughly 20% more likely to default than the average
+
+- I am going to group skilled_trade, healthcare, management, executive, other_title, education as "Medium Risk" as they are all within +/- 10% of the average 
+
+- I am going to group creative_media, law_security, project_mgmt, military, engineering, finance_banking as "Low Risk" These occupations are all 10-25% less likely to default than the average
+
+- I am going to put legal in its own "Very Low Risk" category since it is off in its own in terms of grouping. Legal is 32% less likely to default than the average 
+
+## Where do i put the baseline?
+
+What do i do with the baseline? I know that the dataset defualt rate is ~20%. I am going to find the default rate for the contruction occupation, and compare it to the full df default rate. If it is much higher, i will put it in the higher risk bin, if it is much lower it will go in the Low risk bin.
+
+```{r}
+# finding the default rate for people whos occupation is construction_realestate (in the unbalanced data)
+
+construction_risk = train_log %>% filter(emp_occupation == "construction_realestate") %>% summarize(default_rate = mean(loan_default == "Yes"))
+
+construction_risk
+
+
+```
+Construction_realeastate defaults ~4% more than the dataset default rate. I will put that occupation in the High Risk bin
+
+
+
+## Creating the bins 
+```{r}
+train_log_balanced = train_log_balanced %>% mutate(
+  occupational_risk = case_when(
+    emp_occupation %in% c("owner_self", "hospitality" ) ~ "Very High",
+    emp_occupation %in% c("transport_logistics", "missing_title", "sales_retail_cs", "construction_realestate") ~ "High",
+    emp_occupation %in% c("skilled_trade", "healthcare", "management", "executive", "other_title", "education") ~ "Medium",
+    emp_occupation %in% c("creative_media", "law_security", "project_mgmt", "military", "it_engineering", "finance_banking") ~ "Low",
+    emp_occupation == "legal" ~ "Very Low"
+  )
+) %>% select(-emp_occupation)
+
+
+
+holdout_log_balance = holdout_log_balance %>% mutate(
+  occupational_risk = case_when(
+    emp_occupation %in% c("owner_self", "hospitality" ) ~ "Very High",
+    emp_occupation %in% c("transport_logistics", "missing_title", "sales_retail_cs", "construction_realestate") ~ "High",
+    emp_occupation %in% c("skilled_trade", "healthcare", "management", "executive", "other_title", "education") ~ "Medium",
+    emp_occupation %in% c("creative_media", "law_security", "project_mgmt", "military", "it_engineering", "finance_banking") ~ "Low",
+    emp_occupation == "legal" ~ "Very Low"
+  )
+) %>% select(-emp_occupation)
+
+```
+
+Now that ive cleaned up some of the least important variables, and created an occupation risk bin, i am ready to retrain the model
+
+
+## Retraining the model
+
+I am going to use the code from Model2 as a starting point to find the best parameters
+
+alpha = seq(0, 1, .25), lambda = seq(0, 1, length =10)
+
+```{r}
+
+# parallel processing
+cores = parallel::detectCores()
+cl = parallel::makeCluster(cores-1)
+registerDoParallel(cl)
+
+#train the model
+set.seed(123)
+
+logit_model3a = train(
+  loan_default ~.,
+  data = train_log_balanced,
+  method = "glmnet",
+  trControl = ctrl, # 10 fold cv
+  tuneGrid = expand.grid(alpha = seq(0, 1, .25), lambda = seq(0, 1, length =10)),
+  metric = "ROC",
+  family = "binomial"
+)
+
+
+set.seed(123)
+
+logit_model3b = train(
+  loan_default ~.,
+  data = train_log_balanced,
+  method = "glmnet",
+  trControl = ctrl, # 10 fold cv
+  tuneGrid = expand.grid( alpha = 0.98, lambda = c(0.0001, 0.0005, 0.001)),
+  metric = "ROC",
+  family = "binomial"
+)
+
+
+# plot + bestTune of model
+plot(logit_model3a)
+plot(logit_model3b)
+
+
+
+
+logit_model3a$bestTune
+logit_model3b$bestTune
+
+
+
+
+stopCluster(cl)
+registerDoSEQ()
+
+
+```
+Upon expierimenting and tuning on the new data, the best Alpha is .977 (a lasso model) and the lambda is still ~ 0. For whatever reason, the changes i made to the data make lasso regression a more useful. AUC is not as high as it was previously but that is okay as long as recall and F1 improved
+
+
+## Fitting the best Tune
+```{r}
+set.seed(123)
+
+logit_model3 = train(
+  loan_default ~.,
+  data = train_log_balanced,
+  method = "glmnet",
+  trControl = ctrl, # 10 fold cv
+  tuneGrid = expand.grid( alpha = 0.98, lambda = .0001),
+  metric = "ROC",
+  family = "binomial"
+)
+
+# checking coefficients -- ( I used ChatGPT to help make a nice sorted coef table)
+coefs = round(as.matrix(coef(logit_model3$finalModel,s = logit_model3$bestTune$lambda)), 3)
+coef_df = data.frame(variable = rownames(coefs), coef = coefs[, 1], row.names = NULL)
+coef_sorted = coef_df[order(-coef_df$coef), ]
+print(coef_sorted)
+
+# checking variables importance
+importance = varImp(logit_model3, scale = FALSE)
+plot(importance, top = 20)
+
+```
+it looks like some of my data cleaning and feature engineering paid off. The occupational risk bins are still very meaningful to the model. There are very few variables that have 0 or near 0 coefs. This is a huge imporvement.
+
+## Making Predictions
+
+making predictions over the optimized F1 threshold
+```{r}
+
+
+
+log_preds$log3_probs = predict(logit_model3,
+                                 newdata = holdout_log_balance, ## its not actually balanced i just needed a name for it that matched since i added/removed vars
+                                 type = "prob")[,"Yes"]
+
+
+
+# ROC/AUC
+roc_model3 <- roc(response = log_preds$Actuals,
+               predictor = as.vector(log_preds$log3_probs))
+
+auc_val <- auc(roc_model3)
+auc_val
+
+
+
+# optimizing predictions threshold on F1
+thresholds = seq(0.01, 0.99, by = 0.01)
+
+## Compute F1 for each threshold
+f1_scores = sapply(thresholds, function(th) {
+  log3_class <- ifelse(log_preds$log3_probs >= th, "Yes", "No")
+  F1_Score(y_pred = log3_class, y_true = log_preds$Actuals, positive = "Yes")
+})
+
+## Find the threshold that maximizes F1
+best_thresh_f1 <- thresholds[which.max(f1_scores)]
+best_f1 <- max(f1_scores, na.rm = TRUE)
+
+
+log_preds$log3_class = factor(ifelse(log_preds$log3_probs >= best_thresh_f1, "Yes", "No"))
+
+
+confusionMatrix(log_preds$log3_class,
+                log_preds$Actuals,
+                positive = "Yes")
+
+cat("Best threshold (max F1):", round(best_thresh_f1, 3), "\n")
+cat("Best F1 Score:", round(best_f1, 3), "\n")
+```
+
+# ROC Curve
+```{r}
+
+model3_pred = prediction(log_preds$log3_prob, log_preds$Actuals)
+model3_perf = performance(model3_pred, "tpr", "fpr")
+
+plot(model3_perf, col = "blue", lwd = 2, main = "ROC curve")
+abline(a = 0, b = 1, col = "red", lty = 2, lwd = 2)
+
+```
+
+## Lift Chart
+```{r}
+lift3 = performance(model3_pred, "lift", "rpp")
+plot(lift3, main = "Lift Chart", col = 2)
+axis(1, at=seq(0,1, by = .1))
+legend(.6,4.8, legend = c("model3"),
+       col = "red", lty = 1, cex = .8)
+
+```
+
+This an improvement upon our last model. While overall accuracy has declined, i am not worried about it, since our recall is up to 66%, and the detection rate rose to almost 13%. The model is still overpredicting the Yes class but it is correctly identifying more defaulters than the previous model.
+F1 is lower than previous models though, so i do not think we can move forward with this model since F1 is our target statistic for best model.
+
+
+
+# Model 4 - All factor variables as dummies
+experimenting with different ways to train the model
+
+
+## One-hot encoding factor variables
+I am using a snippet of code I found on StackOverflow to one-hot encdode my factor variables
+```{r}
+# dummyVars collects a list of factors and levels to be applied to my training data
+dmy = dummyVars("loan_default ~ .", data = train_log_balanced)
+# Applies the one-hot encoding on my training data
+train_log_balanced_onehot = data.frame(predict(dmy, newdata = train_log_balanced))
+# Adding back in the Target (dont want to one-hot the target)
+train_log_balanced_onehot$loan_default = train_log_balanced$loan_default
+
+head(train_log_balanced_onehot)
+
+# From the research ive done, its best to reuse the train dummyVars (dmy) to create the holdout dummies to avoid leakage
+holdout_log_balanced_onehot = data.frame(predict(dmy, newdata = holdout_log_balance))
+# adding target back in
+holdout_log_balanced_onehot$loan_default = holdout_log_balance$loan_default
+
+head(holdout_log_balanced_onehot)
+```
+*Loan Default is still a factor so i dont know what the warning is about*
+
+All factor variables are now one-hot encoded. I am going to fit a modeling using the data and compare it to the previous models
+
+## Fitting the model
+
+I am going to start with the same starter grid from model 3, and tune from there:
+
+alpha = seq(0, 1, .25), lambda = seq(0, 1, length =10)
+
+```{r}
+
+# parallel processing
+cores = parallel::detectCores()
+cl = parallel::makeCluster(cores-1)
+registerDoParallel(cl)
+
+#train the model
+set.seed(123)
+
+logit_model4a = train(
+  loan_default ~.,
+  data = train_log_balanced_onehot,
+  method = "glmnet",
+  trControl = ctrl, # 10 fold cv
+  tuneGrid = expand.grid(alpha = seq(0, 1, .25), lambda = seq(0, 1, length =10)),
+  metric = "ROC",
+  family = "binomial"
+)
+
+set.seed(123)
+
+logit_model4b = train(
+  loan_default ~.,
+  data = train_log_balanced_onehot,
+  method = "glmnet",
+  trControl = ctrl, # 10 fold cv
+  tuneGrid = expand.grid(alpha = seq(0, .2, .025), lambda = c(0.001, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05) # testing very small regularization penalties
+),
+  metric = "ROC",
+  family = "binomial"
+)
+
+
+set.seed(123)
+
+logit_model4c = train(
+  loan_default ~.,
+  data = train_log_balanced_onehot,
+  method = "glmnet",
+  trControl = ctrl, # 10 fold cv
+  tuneGrid = expand.grid(alpha = seq(0, 0.1, .005), lambda = c(0.001, 0.005, 0.01, 0.02, 0.03, 0.04, 0.05) # testing very small regularization penalties
+),
+  metric = "ROC",
+  family = "binomial"
+)
+
+plot(logit_model4a)
+plot(logit_model4b)
+plot(logit_model4c)
+
+
+logit_model4a$bestTune
+logit_model4b$bestTune
+logit_model4c$bestTune
+
+
+
+stopCluster(cl)
+registerDoSEQ()
+```
+Based on my first fit, I can tell small lambda values are going to perform well in this model. Every Alpha value performs best at a lambda of 0. For my next tune, ill zoom in on small lambda values to find a best alpha.
+
+This 2nd tune again confirms that near-0 lambdas will perform best. It appears these models might fit better in a lasso type model (alphas closer to 1 appear to perform slightly better). Performance breaks down consistently when lambda is .1. A very small lambda will be my best tune. That being said, my previous model using an Alpha of almost 1, performed the worst of the existing models. I am going to try to hone in on a smaller alpha for a more ridge like model, since the aggressive shrinking of a Lasso regression might have been detrimental to F1 performance.
+
+Based on my 3rd tune (the results for model 4b plotted above) show that performance actually increases as alpha increases from 0 to ~ 0.025 - 0.05. This looks like it should be my sweet spot, since after that performance falls, or plateaus.
+
+Based On my Final tune (results of 4c) I believe i have finally found the best tune. Alpha of .095 shows the best performance, and starts its decline after that at a lambda of .001. This will be my final fit
+
+
+## Model 4 final fit 
+```{r}
+set.seed(123)
+
+logit_model4 = train(
+  loan_default ~.,
+  data = train_log_balanced_onehot,
+  method = "glmnet",
+  trControl = ctrl, # 10 fold cv
+  tuneGrid = expand.grid(alpha = 0.095, lambda = 0.001),
+  metric = "ROC",
+  family = "binomial"
+)
+
+
+
+
+
+# checking coefficients -- ( I used ChatGPT to help make a nice sorted coef table)
+coefs = round(as.matrix(coef(logit_model4$finalModel,s = logit_model4$bestTune$lambda)), 3)
+coef_df = data.frame(variable = rownames(coefs), coef = coefs[, 1], row.names = NULL)
+coef_sorted = coef_df[order(-coef_df$coef), ]
+print(coef_sorted)
+
+# checking variables importance
+importance = varImp(logit_model4, scale = FALSE)
+plot(importance, top = 20)
+
+saveRDS(logit_model4, "logit_model4.rds")
+
+
+```
+Some variables have been shrunk down to 0. most are levels of a factor, so that is not concerning. Var importance is similar to previous models
+
+Variable importance is very similar to previous models. Loan to income ratio retook the top spot for importance. The binning of occupations into risk pools seems to have made other variables also more important than previously.
+
+## Making Predictions
+
+making predictions over the optimized F1 threshold
+```{r}
+
+
+
+log_preds$log4_probs = predict(logit_model4,
+                                 newdata = holdout_log_balanced_onehot, ## its not actually balanced i just needed a name for it that matched since i added/removed vars
+                                 type = "prob")[,"Yes"]
+
+
+
+# ROC/AUC
+roc_model4 <- roc(response = log_preds$Actuals,
+               predictor = as.vector(log_preds$log4_probs))
+
+auc_val <- auc(roc_model4)
+auc_val
+
+
+
+# optimizing predictions threshold on F1
+thresholds = seq(0.01, 0.99, by = 0.01)
+
+## Compute F1 for each threshold
+f1_scores = sapply(thresholds, function(th) {
+  log4_class <- ifelse(log_preds$log4_probs >= th, "Yes", "No")
+  F1_Score(y_pred = log4_class, y_true = log_preds$Actuals, positive = "Yes")
+})
+
+## Find the threshold that maximizes F1 -- this is what will be used in place of .5
+best_thresh_f1 <- thresholds[which.max(f1_scores)]
+best_f1 <- max(f1_scores, na.rm = TRUE)
+
+
+log_preds$log4_class = factor(ifelse(log_preds$log4_probs >= best_thresh_f1, "Yes", "No"))
+
+
+confusionMatrix(log_preds$log4_class,
+                log_preds$Actuals,
+                positive = "Yes")
+
+cat("Best threshold (max F1):", round(best_thresh_f1, 3), "\n")
+cat("Best F1 Score:", round(best_f1, 3), "\n")
+```
+
+## ROC Curve
+```{r}
+
+model4_pred = prediction(log_preds$log4_prob, log_preds$Actuals)
+model4_perf = performance(model4_pred, "tpr", "fpr")
+
+plot(model4_perf, col = "blue", lwd = 2, main = "ROC curve")
+abline(a = 0, b = 1, col = "red", lty = 2, lwd = 2)
+
+```
+## Lift Chart
+```{r}
+lift4 = performance(model4_pred, "lift", "rpp")
+plot(lift4, main = "Lift Chart", col = 2)
+axis(1, at=seq(0,1, by = .1))
+legend(.6,4.8, legend = c("model4"),
+       col = "red", lty = 1, cex = .8)
+
+```
+
+
+
+F1 score of .452. This is minimally better than the earliest log models i've fit. However, this model has the best recall of all my elastic nets thus far. Though it has a lower F1 than previous models, it might still be the best model produced thus far in terms of identifying those who will default. It is still grossly over predicting the Yes class, resulting in 20,000 false positives. 
+
+# Model 5 - 
+```{r}
+#Creating cntrl for the Stepwise model
+ctrl2 <- trainControl(method = "none", number = 10, 
+                     summaryFunction = twoClassSummary,
+                     classProbs = TRUE, 
+                     savePredictions = "final")
+```
+
+```{r}
+logit.model5 <- train(
+  loan_default ~ ., 
+  data = train_log_balanced,
+  method = "glmStepAIC",
+  trControl = ctrl2,
+  metric = "ROC",
+  family = "binomial",
+  trace = 0
+)
+summary(logit.model5)
+
+```
+## Predictions
+```{r}
+log_preds$log5_probs = predict(logit.model5,
+                                 newdata = holdout_log_balance,
+                                 type = "prob")[,"Yes"]
+
+# ROC/AUC
+roc_model5 <- roc(response = log_preds$Actuals,
+               predictor = as.vector(log_preds$log5_probs))
+
+auc_val <- auc(roc_model5)
+auc_val
+
+#optimizing predictions threshold on F1
+thresholds = seq(0.01, 0.99, by = 0.01)
+
+## Compute F1 for each threshold
+f1_scores = sapply(thresholds, function(th) {
+  log5_class <- ifelse(log_preds$log5_probs >= th, "Yes", "No")
+  F1_Score(y_pred = log5_class, y_true = log_preds$Actuals, positive = "Yes")
+})
+
+## Find the threshold that maximizes F1 -- this is what will be used in place of .5
+best_thresh_f1 <- thresholds[which.max(f1_scores)]
+best_f1 <- max(f1_scores, na.rm = TRUE)
+
+
+log_preds$log5_class = factor(ifelse(log_preds$log5_probs >= best_thresh_f1, "Yes", "No"))
+
+
+confusionMatrix(log_preds$log5_class,
+                log_preds$Actuals,
+                positive = "Yes")
+
+cat("Best threshold (max F1):", round(best_thresh_f1, 3), "\n")
+cat("Best F1 Score:", round(best_f1, 3), "\n")
+```
+
+
+## ROC Curve
+```{r}
+
+model5_pred = prediction(log_preds$log5_prob, log_preds$Actuals)
+model5_perf = performance(model5_pred, "tpr", "fpr")
+
+plot(model5_perf, col = "blue", lwd = 2, main = "ROC curve")
+abline(a = 0, b = 1, col = "red", lty = 2, lwd = 2)
+
+```
+
+## Lift Chart
+```{r}
+lift5 = performance(model5_pred, "lift", "rpp")
+plot(lift5, main = "Lift Chart", col = 2)
+axis(1, at=seq(0,1, by = .1))
+legend(.6,4.8, legend = c("model5"),
+       col = "red", lty = 1, cex = .8)
+
+```
+
+# Comparing our models
+
+
+
+
+## ROC Comparison
+```{r}
+plot(model1_perf ,col = "blue", lwd = 2 , main = "ROC Curves")
+plot(model2_perf, col = "green", lwd = 2 , add = TRUE)
+plot(model3_perf, col = "orange", lwd = 2 , add = TRUE)
+plot(model4_perf, col = "pink", lwd = 2 , add = TRUE)
+plot(model5_perf, col = "yellow", lwd = 2 , add = TRUE)
+
+abline(a = 0, b = 1, col = "red", lty = 2, lwd = 2)
+
+```
+ROC for our models are all very similar. There is very little differentiation between models using ROC
+
+## Comparing Lift
+```{r}
+plot(lift1, main = "Lift Chart", col = "blue")
+plot(lift2,  col = "green", add = TRUE)
+plot(lift3,  col = "orange", add = TRUE)
+plot(lift4,  col = "pink", add = TRUE)
+plot(lift5,  col = "yellow", add = TRUE)
+
+```
+Models 3,4, and 5 all overlap one another. These models offer the least overall lift compared to models 1 and 2. This means models 1 and 2 are actually better at identifying high change defaulters. I did not expect this, as these models both have the lowest recall. This could have something to do with the final 3 models being trained on balanced data vs raw unbalanced data.
+
+## Comparing key metrics
+I used ChatGPT to produce a clean comparison table to compare model performance for our 5 models
+
+```{r}
+get_manual_metrics <- function(pred_class, pred_prob, actual, model_name) {
+cm <- confusionMatrix(
+factor(pred_class, levels = c("No", "Yes")),
+factor(actual, levels = c("No", "Yes")),
+positive = "Yes"
+)
+
+F1_val <- MLmetrics::F1_Score(y_pred = as.character(pred_class),
+y_true = as.character(actual),
+positive = "Yes")
+AUC_val <- pROC::auc(ifelse(actual == "Yes", 1, 0),
+as.numeric(pred_prob),
+direction = "<")
+
+data.frame(
+Model = model_name,
+Accuracy = round(cm$overall["Accuracy"], 4),
+Recall = round(cm$byClass["Sensitivity"], 4),
+Precision = round(cm$byClass["Pos Pred Value"], 4),
+F1 = round(F1_val, 4),
+Balanced_Accuracy = round(cm$byClass["Balanced Accuracy"], 4),
+Detection_Rate = round(cm$byClass["Detection Rate"], 4),
+AUC = round(as.numeric(AUC_val), 4)
+)
+}
+
+metrics_model1 <- get_manual_metrics(log_preds$log1_class, log_preds$log1_prob, log_preds$Actuals, "model1")
+metrics_model2  <- get_manual_metrics(log_preds$log2_class,   log_preds$log2_prob,   log_preds$Actuals, "model2")
+metrics_model3  <- get_manual_metrics(log_preds$log3_class,  log_preds$log3_probs,  log_preds$Actuals, "model3")
+metrics_model4  <- get_manual_metrics(log_preds$log4_class,  log_preds$log4_probs,  log_preds$Actuals, "model4")
+metrics_model5  <- get_manual_metrics(log_preds$log5_class,  log_preds$log5_probs,  log_preds$Actuals, "model5")
+
+
+model_comparison <- rbind(metrics_model1, metrics_model2, metrics_model3, metrics_model4, metrics_model5) 
+model_comparison
+
+```
+Based on our comparison table, Model 4 appears to be our best model. The goal of our model is to predict loan defaults. Model 4, though it has one of the worst F1 of the bunch, has the best recall at .67, and solid balanced accuracy (.6773). We think this model is the best for the purpose of identifying loan defaults, since it has the best detection rate, and best recall of the models tested. While this model still overpredicts the "Yes" class, it does a better job than our other models are correctly identifying defaulters and has very similar balanced accuracy compared to our other models. This is why we chose model 4 over other models with better F1 or precision scores, and lift values.
+
+

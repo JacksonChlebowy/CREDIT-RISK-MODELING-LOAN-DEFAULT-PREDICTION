@@ -1,0 +1,1331 @@
+---
+title: "group11a_Chlebowy_Shane_Xgboost"
+output: html_document
+date: "2025-11-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Loading Libraries and Data
+```{r}
+library(parallel)
+library(xgboost)
+library(dplyr)
+library(doParallel)
+library(caret)
+library(MLmetrics)
+library(pROC)
+library(purrr)
+
+file = "train_trees.rds"
+train_trees = readRDS(file)
+
+holdout = "holdout_trees.rds"
+holdout_trees = readRDS(holdout)
+```
+
+
+# Xgboost models
+
+opening up parallel processing 
+
+```{r}
+cores = parallel::detectCores()
+cores
+cl = parallel::makeCluster(cores-1)
+registerDoParallel(cl)
+```
+
+## Model 1 -- Basic xgboost
+```{r model1, eval=FALSE}
+# Setting up Cross-validation control
+cv_control = trainControl(
+  method = "cv",
+  number = 3,
+  allowParallel = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary, # Needed for ROC
+
+)
+grid = expand.grid(
+  nrounds = 200,
+  max_depth = c(4, 6),
+  eta = c(0.05, 0.1),
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+# Training the xgboost model
+set.seed(123)
+xgb_model1 = train(
+   loan_default ~.,
+   data = train_trees,
+   method = "xgbTree",
+   trControl = cv_control,
+   tuneGrid = grid,
+   metric = "ROC"
+)
+
+stopCluster(cl)
+registerDoSEQ()
+```
+
+### Printing the Output
+```{r}
+file = "xgb_model1.rds"
+xgb_model1 = readRDS(file)
+
+print(xgb_model1$bestTune)
+
+xgb_model1$results[order(-xgb_model1$results$ROC ), ][1:10, ]
+
+
+xgb_model1$results %>%
+  group_by(max_depth) %>%
+  summarise(mean_ROC = mean(ROC),
+            sd_ROC = sd(ROC),
+            best_ROC = max(ROC)) %>%
+  arrange(desc(best_ROC))
+
+```
+### Making Predictions
+```{r}
+tree_preds = readRDS("tree_preds.rds")
+tree_preds$xgb1_class = predict(xgb_model1,
+                                newdata = holdout_trees,
+                                type = "raw")
+tree_preds$xgb1_prob = predict(xgb_model1,
+                                newdata = holdout_trees,
+                                type = "prob")[,"Yes"]
+confusionMatrix(tree_preds$xgb1_class,
+                tree_preds$Actuals,
+                positive = "Yes")
+
+```
+This basic xgboost provides very little extra predictive power compared to early tree models. 3% boost on overall accuracy, low (.07) detection rate, low recall (.38). This model predicts more false Negatives than it does True Positives 
+
+## Model 2
+
+Making improvements upon the first model by fine tuning the grid around the besttune from model 1
+```{r model2, eval=FALSE}
+# opening parallel processing
+
+cores = parallel::detectCores()
+cores
+cl = parallel::makeCluster(cores-1)
+registerDoParallel(cl)
+
+# using the same cv_control
+cv_control = trainControl(
+  method = "cv",
+  number = 3,
+  allowParallel = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary 
+)
+# changing the grid to try different controls
+grid = expand.grid(
+  nrounds = c(200, 400, 600),
+  max_depth = c(5, 7, 10),
+  eta = c(0.01, 0.05, 0.1),
+  gamma = c(0, 0.05),
+  colsample_bytree = c(0.7, 1.0),
+  min_child_weight = c(1, 3),
+  subsample = c(0.7, 1.0)
+)
+
+set.seed(123)
+xgb_model2 = train(
+  loan_default ~ .,
+  data = train_trees,
+  method = "xgbTree",
+  trControl = cv_control,
+  tuneGrid = grid,
+  metric = "ROC",        # ✅ AUC target
+  tree_method = "hist"   #should speed up training 
+)
+
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+
+
+### Printing the Output
+```{r}
+file = "xgb_model2.rds"
+xgb_model2 = readRDS(file)
+
+print(xgb_model2$bestTune)
+
+```
+
+
+### Making Predictions
+```{r}
+tree_preds$xgb2_class = predict(xgb_model2,
+                                newdata = holdout_trees,
+                                type = "raw")
+tree_preds$xgb2_prob = predict(xgb_model2,
+                                newdata = holdout_trees,
+                                type = "prob")[,"Yes"]
+confusionMatrix(tree_preds$xgb2_class,
+                tree_preds$Actuals,
+                positive = "Yes")
+
+```
+Results not much better than the previous model. Slight improvements to Overall accuracy and sensitivity. I need to account for the unbalanced nature of the data to train a better model
+
+## Model 3 -- Using scale_pos_weight to improve recall and overall accuracy
+this function gives more weight to minority classes, punishing the model more for misclassifying them. This should help us better predict actual loan defaults.
+
+### Finding Scale_pos_weight
+```{r}
+table(train_trees$loan_default)
+
+scale_pos_weight = 191084 / 46632
+scale_pos_weight
+
+```
+### Training the Tree
+
+For this tree, I am taking a different approach, I am going to train the model on a grid similar to previous models, find best tune and inspect what models performed best, and fitting again based on findings from top 10 performers. I am starting with a much larger Tunegrid this time so i can start very broad and hone in on top performance.
+
+```{r, eval=FALSE}
+# opening parallel processing
+cores = parallel::detectCores()
+cores
+cl = parallel::makeCluster(cores-1)
+registerDoParallel(cl)
+
+# using the same cv_control
+cv_control = trainControl(
+  method = "cv",
+  number = 3,
+  allowParallel = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary 
+)
+# changing the grid to try different controls -- going to run 1 grid, find best performing controls, tune some more with a new grid
+grid_stage1 = expand.grid(
+  nrounds = c(200, 400),
+  max_depth = c(3, 6, 9),
+  eta = c(0.05, 0.1, 0.2),
+  gamma = c(0, 0.25, 0.5),
+  colsample_bytree = c(0.7, 0.9),
+  min_child_weight = c(1, 3, 5),
+  subsample = c(0.8, 1.0)
+)
+
+set.seed(123)
+xgb_model3 = train(
+  loan_default ~ .,
+  data = train_trees,
+  method = "xgbTree",
+  trControl = cv_control,
+  tuneGrid = grid_stage1,
+  metric = "ROC",
+  tree_method = "hist",
+  scale_pos_weight = scale_pos_weight
+)
+
+
+stopCluster(cl)
+registerDoSEQ()
+```
+
+### Checking first pass results 
+```{r, eval=FALSE}
+# model best tune + top 10 tunes to ID best controls
+xgb_model3$bestTune
+xgb_model3$results[order(-xgb_model3$results$ROC), ][1:10, ]
+
+# summary stats for each depth -- depth 6 has highest meanROC and overall best ROC
+xgb_model3$results %>%
+  group_by(max_depth) %>%
+  summarise(mean_ROC = mean(ROC),
+            sd_ROC = sd(ROC),
+            best_ROC = max(ROC)) %>%
+  arrange(desc(best_ROC))
+
+```
+Key Takeaways
+- depth 6 makes up all 10 of the best performing trees
+- models performed best with .8 subsample was taken
+- 400 rounds -- going to test 400, 600 next to see if 600 improves the model at all
+- Best model have crazy high sensitivity, but terrible specificity.
+
+### Creating 2nd grid, refining controls
+```{r , eval= FALSE}
+
+# opening parallel processing
+cores = parallel::detectCores()
+cores
+cl = parallel::makeCluster(cores-1)
+registerDoParallel(cl)
+
+# refined grid based on previous results
+grid_stage2 = expand.grid(
+  nrounds = c(300, 400, 600),
+  max_depth = c(6,8), # 6 was best for the last grid, testing depth up to 8 
+  eta = c(0.01, 0.03, 0.05, 0.07), ## honing in on the best eta
+  gamma = c(0.25, 0.5, 0.75),
+  colsample_bytree = c(0.7, 0.9),
+  min_child_weight = c(3, 5, 7), # mostly 3, 5 in top 10, expanding to 7
+  subsample = c(0.8, 0.9)
+)
+
+# fitting model on new grid
+set.seed(123)
+xgb_model3b = train(
+  loan_default ~ .,
+  data = train_trees,
+  method = "xgbTree",
+  trControl = cv_control,
+  tuneGrid = grid_stage2,
+  metric = "ROC",
+  tree_method = "hist",
+  scale_pos_weight = scale_pos_weight
+)
+
+stopCluster(cl)
+registerDoSEQ()
+```
+
+### Checking second pass results 
+```{r, eval=FALSE}
+
+xgb_model3b$bestTune
+xgb_model3b$results[order(-xgb_model3b$results$ROC), ][1:10, ]
+
+
+xgb_model3b$results %>%
+  group_by(nrounds) %>%
+  summarise(mean_ROC = mean(ROC),
+            sd_ROC = sd(ROC),
+            best_ROC = max(ROC)) %>%
+  arrange(desc(best_ROC))
+
+xgb_model3b$results %>%
+  group_by(eta, gamma, min_child_weight, subsample, colsample_bytree) %>%
+  summarise(mean_ROC = mean(ROC), sd_ROC = sd(ROC)) %>%
+  arrange(desc(mean_ROC)) %>%
+  head(10)
+
+```
+Takeaways
+- eta .03 dominates, final grid will focus in on .025 - .035
+-Max Depth 8 in all top 10, will retain 8, and test 10 to see if we can squeeze any ROC gains
+- Gamma .5 and .75 appear most
+- colsample .7 appears in more top trees
+- good mix of 400 and 600 nrounds, ROC is very similar between groups -- going to explore 500, 600, 700 to see if any more performance can be imporoved
+
+### Third pass at tuning
+```{r , eval=FALSE}
+# opening parallel processing
+cores = parallel::detectCores()
+cores
+cl = parallel::makeCluster(cores-1)
+registerDoParallel(cl)
+
+grid_stage3 = expand.grid(
+  nrounds = c(500, 600, 700), 
+  max_depth = c(7, 8, 10),
+  eta = c(0.025, 0.03, 0.035),
+  gamma = c(0.5, 0.65, 0.8),
+  colsample_bytree = c(0.7),
+  min_child_weight = c(5, 7),
+  subsample = c(0.85, 0.9)
+)
+
+set.seed(123)
+xgb_model3c = train(
+  loan_default ~ .,
+  data = train_trees,
+  method = "xgbTree",
+  trControl = cv_control,
+  tuneGrid = grid_stage3,
+  metric = "ROC",
+  tree_method = "hist",
+  scale_pos_weight = scale_pos_weight
+)
+
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+### Checking third pass results 
+```{r, eval=FALSE}
+
+xgb_model3c$bestTune
+xgb_model3c$results[order(-xgb_model3c$results$ROC), ][1:10, ]
+
+
+xgb_model3c$results %>%
+  group_by(nrounds) %>%
+  summarise(mean_ROC = mean(ROC),
+            sd_ROC = sd(ROC),
+            best_ROC = max(ROC)) %>%
+  arrange(desc(best_ROC))
+
+xgb_model3c$results %>%
+  group_by(eta, gamma, min_child_weight, subsample, colsample_bytree) %>%
+  summarise(mean_ROC = mean(ROC), sd_ROC = sd(ROC)) %>%
+  arrange(desc(mean_ROC)) %>%
+  head(10)
+
+```
+### Final fit
+```{r, eval=FALSE}
+# Final model configuration based on Stage 3 tuning
+final_grid = expand.grid(
+  nrounds = 700,
+  max_depth = 7,
+  eta = 0.025,
+  gamma = 0.65,
+  colsample_bytree = 0.7,
+  min_child_weight = 7,
+  subsample = 0.9
+)
+
+
+set.seed(123)
+
+xgb_model3d = train(
+  loan_default ~ .,
+  data = train_trees,
+  method = "xgbTree",
+  trControl = cv_control,
+  tuneGrid = final_grid,
+  metric = "ROC",          
+  tree_method = "hist",
+  scale_pos_weight = scale_pos_weight
+)
+
+```
+
+
+### Making Predictions and optimizing threshold on F1
+```{r}
+file = "xgb_model3.rds"
+xgb_model3d = readRDS(file)
+
+tree_preds$xgb3_class = predict(xgb_model3d,
+                                newdata = holdout_trees,
+                                type = "raw")
+
+tree_preds$xgb3_prob = predict(xgb_model3d,
+                                newdata = holdout_trees,
+                                type = "prob")[,"Yes"]
+library(MLmetrics)
+
+thresholds = seq(0.01, .2, by = 0.001)
+
+f1_scores = sapply(thresholds, function(t) {
+  preds = ifelse(tree_preds$xgb3_prob > t, "Yes", "No")
+  F1_Score(y_pred = preds, y_true = tree_preds$Actuals, positive = "Yes")
+})
+
+best_thresh = thresholds[which.max(f1_scores)]
+best_f1 = max(f1_scores)
+
+cat(sprintf("Best Threshold = %.3f | Max F1 = %.4f\n", best_thresh, best_f1))
+
+tree_preds$xgb3_class = ifelse(tree_preds$xgb3_prob > best_thresh, "Yes", "No") 
+
+confusionMatrix(factor(tree_preds$xgb3_class, levels = c("No", "Yes")),
+                factor(tree_preds$Actuals, levels = c("No", "Yes")),
+                positive = "Yes")
+
+final_f1 = F1_Score(
+  y_pred = tree_preds$xgb3_class,
+  y_true = tree_preds$Actuals,
+  positive = "Yes"
+)
+
+cat(sprintf("Final F1 Score (threshold %.2f): %.4f\n", best_thresh, final_f1))
+```
+The final model has an accuracy of 81.16%, only a 1% gain on the no information rate. 65% recall and 85% specificity. detection rate (12%) is much higher than earlier tested tree models (~7%).
+
+
+
+# Model 4 -- Using Caret to optimize training on F1 instead of AUC
+Optimizing this model on F1 directly instead of AUC. Utilizing a weight grid to test different penalties on misclassified Yes's
+
+```{r, eval=FALSE}
+
+cores = parallel::detectCores()
+cores
+cl = parallel::makeCluster(cores-1)
+registerDoParallel(cl)
+
+customF1 = function(data, lev = NULL, model = NULL) {
+  out = MLmetrics::F1_Score(y_pred = data$pred, y_true = data$obs, positive = "Yes")
+  c(F1 = out)
+}
+
+#cross validate
+cv_control_f1 = trainControl(
+  method = "cv",
+  number = 2, ## cutting cv from 3 folds to 2 to reduce time
+  summaryFunction = customF1,
+  classProbs = TRUE,
+  savePredictions = "final",
+  allowParallel = FALSE 
+
+)
+
+# reusing stage1 grid, feels like good starting point -- had to edit grid slightly due to memory/time issues
+grid_stage1 = expand.grid(
+  nrounds = c(200, 400),
+  max_depth = c(5, 7),
+  eta = c(0.05, 0.1, 0.2),
+  gamma = c(0, 0.25, 0.5),
+  colsample_bytree = c(0.7, 0.9),
+  min_child_weight = c(3, 5),
+  subsample = c(0.8, 1.0)
+)
+
+# trying more intense weights to see if i can get better recall
+weights_to_try = c(scale_pos_weight, scale_pos_weight * 1.25, scale_pos_weight * 1.5)
+
+results_list = list()
+
+set.seed(123)
+for (w in weights_to_try) {
+  cat(sprintf("\nRunning model with scale_pos_weight = %.2f...\n", w))
+  
+  xgb_model4 = train(
+    loan_default ~ .,
+    data = train_trees,
+    method = "xgbTree",
+    trControl = cv_control_f1,
+    tuneGrid = grid_stage1,
+    metric = "F1",
+    tree_method = "hist",
+    scale_pos_weight = w
+  )
+  
+  # Store results
+  results_list[[paste0("w_", w)]] = xgb_model4
+}
+
+# Compare average F1 across runs
+summary_f1 = data.frame(
+  weight = weights_to_try,
+  F1 = sapply(results_list, function(m) max(m$results$F1))
+)
+
+print(summary_f1)
+
+
+stopCluster(cl)
+registerDoSEQ()
+
+```
+more intense weighting did NOT improve performance it actually made it worse. That was not expected. Now i Will refit the model using the best tune, and weight and make predictions on that model. (if i have more time to test further i might try scale_weight * .5)
+
+```{r model4, eval=FALSE}
+
+best_params = results_list[["w_4.09770114942529"]]$bestTune
+print(best_params)
+
+set.seed(123)
+xgb_model4b = train(
+  loan_default ~ .,
+  data = train_trees,
+  method = "xgbTree",
+  trControl = cv_control_f1,
+  tuneGrid = best_params,
+  metric = "F1",
+  tree_method = "hist",
+  scale_pos_weight = 4.09770114942529
+)
+```
+
+## Making Predictions
+```{r}
+file = "xgb_model4.rds"
+xgb_model4b = readRDS(file)
+
+tree_preds$xgb4_class = predict(xgb_model4b,
+                                newdata = holdout_trees,
+                                type = "raw")
+
+tree_preds$xgb4_prob = predict(xgb_model4b,
+                                newdata = holdout_trees,
+                                type = "prob")[,"Yes"]
+library(MLmetrics)
+
+thresholds = seq(0.01, 0.2, by = 0.001)
+
+f1_scores = sapply(thresholds, function(t) {
+  preds = ifelse(tree_preds$xgb4_prob > t, "Yes", "No")
+  F1_Score(y_pred = preds, y_true = tree_preds$Actuals, positive = "Yes")
+})
+
+best_thresh = thresholds[which.max(f1_scores)]
+best_f1 = max(f1_scores)
+
+cat(sprintf("Best Threshold = %.3f | Max F1 = %.4f\n", best_thresh, best_f1))
+
+tree_preds$xgb4_class = ifelse(tree_preds$xgb4_prob > best_thresh, "Yes", "No") 
+
+confusionMatrix(factor(tree_preds$xgb4_class, levels = c("No", "Yes")),
+                factor(tree_preds$Actuals, levels = c("No", "Yes")),
+                positive = "Yes")
+
+final_f1 = F1_Score(
+  y_pred = tree_preds$xgb4_class,
+  y_true = tree_preds$Actuals,
+  positive = "Yes"
+)
+
+cat(sprintf("Final F1 Score (threshold %.2f): %.4f\n", best_thresh, final_f1))
+
+```
+Wow this model performed very poorly, worse than the no information rate even!
+
+
+
+
+
+
+### Saving models before i forget to 
+```{r}
+saveRDS(xgb_model1, "xgb_model1.rds")
+saveRDS(xgb_model2, "xgb_model2.rds")
+saveRDS(xgb_model3d, "xgb_model3.rds")
+saveRDS(xgb_model4b, "xgb_model4.rds")
+
+```
+
+
+# Model 5
+
+I am going to go back, and add logged versions of variables into the training/holdout data to see if this improves performance at all
+
+```{r}
+file = "df_flags_2nd_run.rds"
+df_flags_2nd_run = readRDS(file)
+train_trees_logs = df_flags_2nd_run %>% select(loan_default, int_rate, issue_date_year, last_credit_pull_year, dti_cap38, loan_to_income_ratio_cap, revol_util_cap100, credit_age_months, grade, fico_avg, loan_amnt, total_acc_cap60, loan_amnt, open_acc_cap25, emp_occupation, emp_length, term, inq_last_6mths_bin, purpose, mort_acc_bin, verification_status, last_delinq_bin, delinq_2yrs_cap1, home_ownership, initial_list_status, any_bankruptcy, log_mths_since_last_delinq, log_annual_inc, log_revol_bal )
+
+
+holdout = "holdout.rds"
+holdout_trees_logs = readRDS(holdout)
+holdout_trees_logs = holdout_trees_logs %>% select(loan_default, int_rate, issue_date_year, last_credit_pull_year, dti_cap38, loan_to_income_ratio_cap, revol_util_cap100, credit_age_months, grade, fico_avg, loan_amnt, total_acc_cap60, loan_amnt, open_acc_cap25, emp_occupation, emp_length, term, inq_last_6mths_bin, purpose, mort_acc_bin, verification_status, last_delinq_bin, delinq_2yrs_cap1, home_ownership, initial_list_status, any_bankruptcy, log_mths_since_last_delinq, log_annual_inc, log_revol_bal )
+
+# binning credit age months to hopefully incrase performance 
+
+train_trees_logs = train_trees_logs %>%
+  mutate(credit_age_bin = case_when(
+    credit_age_months < 84  ~ "Under7yrs", ## according to research 7 years is when risk curve flattens for lenders
+    credit_age_months < 181 ~ "7to15yrs",
+    TRUE ~ "15plus"
+  )) %>%
+  mutate(credit_age_bin = factor(credit_age_bin,
+                                 levels = c("Under7yrs", "7to15yrs", "15plus")))%>%
+  select(-credit_age_months)
+
+
+
+holdout_trees_logs = holdout_trees_logs %>%
+  mutate(credit_age_bin = case_when(
+    credit_age_months < 84  ~ "Under7yrs",
+    credit_age_months < 181 ~ "7to15yrs",
+    TRUE ~ "15plus"
+  )) %>%
+  mutate(credit_age_bin = factor(credit_age_bin,
+                                 levels = c("Under7yrs", "7to15yrs", "15plus"))) %>%
+  select(-credit_age_months)
+
+
+# Adding Interaction Terms
+
+train_trees_logs = train_trees_logs %>%
+  mutate(
+    dti_log_income = dti_cap38 * log_annual_inc,
+    
+    revol_util_fico = revol_util_cap100 * fico_avg,
+
+    inq6_fico = as.numeric(inq_last_6mths_bin) * fico_avg
+  )
+
+holdout_trees_logs = holdout_trees_logs %>%
+  mutate(
+    dti_log_income = dti_cap38 * log_annual_inc,
+    
+    revol_util_fico = revol_util_cap100 * fico_avg,
+
+    inq6_fico = as.numeric(inq_last_6mths_bin) * fico_avg
+  )
+
+
+```
+
+
+
+
+# Fitting the model -- using model 1 grid and cv and new data w logs and interactions
+```{r, eval=FALSE}
+cores = parallel::detectCores()
+cores
+cl = parallel::makeCluster(cores-1)
+registerDoParallel(cl)
+
+# Setting up Cross-validation control
+cv_control = trainControl(
+  method = "cv",
+  number = 3,
+  allowParallel = TRUE,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary, # Needed for ROC
+
+)
+grid = expand.grid(
+  nrounds = 200,
+  max_depth = c(4, 6),
+  eta = c(0.05, 0.1),
+  gamma = 0,
+  colsample_bytree = 0.8,
+  min_child_weight = 1,
+  subsample = 0.8
+)
+
+# Training the xgboost model
+set.seed(123)
+xgb_model5 = train(
+   loan_default ~.,
+   data = train_trees_logs,
+   method = "xgbTree",
+   trControl = cv_control,
+   tuneGrid = grid,
+   metric = "ROC",
+   tree_method = "hist",
+   scale_pos_weight = 4.1,
+   eval_metric = "auc"
+)
+
+
+stopCluster(cl)
+registerDoSEQ()
+```
+
+## Checking results
+```{r, eval=FALSE}
+
+xgb_model5$bestTune
+xgb_model5$results[order(-xgb_model5$results$ROC), ][1:10, ]
+```
+
+
+
+## Making Predictions
+```{r, eval=FALSE}
+tree_preds$xgb5_class = predict(xgb_model5,
+                                newdata = holdout_trees_logs,
+                                type = "raw")
+
+tree_preds$xgb5_prob = predict(xgb_model5,
+                                newdata = holdout_trees_logs,
+                                type = "prob")[,"Yes"]
+library(MLmetrics)
+
+thresholds = seq(0.01, 0.9, by = 0.01)
+
+f1_scores = sapply(thresholds, function(t) {
+  preds = ifelse(tree_preds$xgb5_prob > t, "Yes", "No")
+  F1_Score(y_pred = preds, y_true = tree_preds$Actuals, positive = "Yes")
+})
+
+best_thresh = thresholds[which.max(f1_scores)]
+best_f1 = max(f1_scores)
+
+cat(sprintf("Best Threshold = %.3f | Max F1 = %.4f\n", best_thresh, best_f1))
+
+tree_preds$xgb4_class = ifelse(tree_preds$xgb5_prob > best_thresh, "Yes", "No") 
+
+confusionMatrix(factor(tree_preds$xgb5_class, levels = c("No", "Yes")),
+                factor(tree_preds$Actuals, levels = c("No", "Yes")),
+                positive = "Yes")
+
+final_f1 = F1_Score(
+  y_pred = tree_preds$xgb5_class,
+  y_true = tree_preds$Actuals,
+  positive = "Yes"
+)
+
+cat(sprintf("Final F1 Score (threshold %.2f): %.4f\n", best_thresh, final_f1))
+
+```
+
+## 2nd pass -- new grid
+using a similar grid to previous models
+```{r model5, eval=FALSE}
+
+cores = parallel::detectCores()
+cores
+cl = parallel::makeCluster(cores-1)
+registerDoParallel(cl)
+
+grid_fixed = expand.grid(
+  nrounds = c(400, 600),
+  max_depth = c(6, 8),
+  eta = c(0.03, 0.05),
+  gamma = c(0.25, 0.5),
+  colsample_bytree = 0.8,
+  min_child_weight = c(3, 5),
+  subsample = 0.8
+)
+
+
+# Training the xgboost model
+set.seed(123)
+xgb_model5b = train(
+   loan_default ~.,
+   data = train_trees_logs,
+   method = "xgbTree",
+   trControl = cv_control,
+   tuneGrid = grid_fixed,
+   metric = "ROC",
+   tree_method = "hist",
+   scale_pos_weight = 4.1,
+   eval_metric = "auc"
+)
+
+
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+```{r}
+file = "xgb_model5.rds"
+xgb_model5b = readRDS(file)
+
+tree_preds$xgb5_class = predict(xgb_model5b,
+                                newdata = holdout_trees_logs,
+                                type = "raw")
+
+tree_preds$xgb5_prob = predict(xgb_model5b,
+                                newdata = holdout_trees_logs,
+                                type = "prob")[,"Yes"]
+
+pred_probs = predict(xgb_model5b, newdata = holdout_trees_logs, type = "prob")[, "Yes"]
+thresholds = seq(0.001, 0.15, by = 0.001) ## honed in on this range over time, most opt thresholds have been 0.1
+f1s = sapply(thresholds, function(t) {
+  preds = ifelse(pred_probs > t, "Yes", "No")
+  MLmetrics::F1_Score(y_pred = preds, y_true = holdout_trees_logs$loan_default, positive = "Yes")
+})
+best_thresh = thresholds[which.max(f1s)]
+cat("Best F1 threshold:", best_thresh, "\n")
+
+
+
+tree_preds$xgb5_class = ifelse(tree_preds$xgb5_prob > best_thresh, "Yes", "No") 
+
+confusionMatrix(factor(tree_preds$xgb5_class, levels = c("No", "Yes")),
+                factor(tree_preds$Actuals, levels = c("No", "Yes")),
+                positive = "Yes")
+
+final_f1 = F1_Score(
+  y_pred = tree_preds$xgb5_class,
+  y_true = tree_preds$Actuals,
+  positive = "Yes"
+)
+
+cat(sprintf("Final F1 Score (threshold %.2f): %.4f\n", best_thresh, final_f1))
+
+
+```
+These results look good. Very similar to the previous models. .65 recall, .75 balanced accuracy
+
+
+## Model 6 -- trying to imporove upon model 5 further
+fitting deeper trees, testing heavier weighting, and more rounds
+
+```{r, eval=FALSE}
+
+cores = parallel::detectCores()
+cl = parallel::makeCluster(cores - 1)
+registerDoParallel(cl)
+
+cv_control = trainControl(
+  method = "cv",
+  number = 5,                       
+  summaryFunction = twoClassSummary, 
+  classProbs = TRUE,                 
+  savePredictions = "final",
+  allowParallel = TRUE
+)
+
+grid_final = expand.grid(
+  nrounds = c(600, 800),             
+  max_depth = c(6, 8, 9),            
+  eta = c(0.03, 0.05),
+  gamma = c(0.25, 0.5),
+  colsample_bytree = 0.8,
+  min_child_weight = c(3, 5),
+  subsample = 0.8
+)
+
+set.seed(123)
+
+xgb_model6 = train(
+  loan_default ~ .,
+  data = train_trees_logs,
+  method = "xgbTree",
+  trControl = cv_control,
+  tuneGrid = grid_final,
+  metric = "ROC",            
+  tree_method = "hist",
+  scale_pos_weight = 5,       
+  eval_metric = "auc"
+)
+
+xgb_model6$bestTune
+max(xgb_model6$results$ROC)
+
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+## predictions and confusion matrix
+```{r, eval=FALSE}
+
+tree_preds$xgb6_class = predict(xgb_model6,
+                                newdata = holdout_trees_logs,
+                                type = "raw")
+
+tree_preds$xgb6_prob = predict(xgb_model6,
+                                newdata = holdout_trees_logs,
+                                type = "prob")[,"Yes"]
+
+pred_probs = predict(xgb_model6, newdata = holdout_trees_logs, type = "prob")[, "Yes"]
+thresholds = seq(0.001, 0.15, by = 0.001) ## honed in on this range over time, most opt thresholds have been 0.1
+f1s = sapply(thresholds, function(t) {
+  preds = ifelse(pred_probs > t, "Yes", "No")
+  MLmetrics::F1_Score(y_pred = preds, y_true = holdout_trees_logs$loan_default, positive = "Yes")
+})
+best_thresh = thresholds[which.max(f1s)]
+cat("Best F1 threshold:", best_thresh, "\n")
+
+
+
+tree_preds$xgb6_class = ifelse(tree_preds$xgb6_prob > best_thresh, "Yes", "No") 
+
+confusionMatrix(factor(tree_preds$xgb6_class, levels = c("No", "Yes")),
+                factor(tree_preds$Actuals, levels = c("No", "Yes")),
+                positive = "Yes")
+
+final_f1 = F1_Score(
+  y_pred = tree_preds$xgb6_class,
+  y_true = tree_preds$Actuals,
+  positive = "Yes"
+)
+
+cat(sprintf("Final F1 Score (threshold %.2f): %.4f\n", best_thresh, final_f1))
+
+
+```
+This model has the highest F1, Sensitivity and Detection rate of our boosted models. Our model is correctly identifying 2/3 defaulters which is pretty solid. 
+
+## checking variable importance -- interested to see how diff it might be with logged vars
+```{r}
+#library(xgboost)
+#xgb.plot.importance(xgb.importance(model = xgb_model6$finalModel))
+
+
+train_trees_logs = train_trees_logs %>%
+  mutate(    loan_age = pmax(0, last_credit_pull_year - issue_date_year),
+) %>% select(-issue_date_year)
+
+holdout_trees_logs = holdout_trees_logs %>%
+  mutate(    loan_age = pmax(0, last_credit_pull_year - issue_date_year),
+)%>% select(-issue_date_year) # Keeping last credit pull because i feel like that does have some predictive power independent of the duration of the loan. A more recent pull might indicate weaker credit/higher liklihood of default
+
+
+```
+
+I am a little concerned with how important the date variables are to the model. I think i am going to create a new variable for loan age 
+
+## fitting same model again, without raw date col
+```{r, eval=FALSE}
+
+cores = parallel::detectCores()
+cl = parallel::makeCluster(cores - 1)
+registerDoParallel(cl)
+
+-
+cv_control = trainControl(
+  method = "cv",
+  number = 5,                       
+  summaryFunction = twoClassSummary, 
+  classProbs = TRUE,                 
+  savePredictions = "final",
+  allowParallel = TRUE
+)
+
+
+grid_final = expand.grid(
+  nrounds = c(600, 800),             
+  max_depth = c(8, 9, 12),            
+  eta = c(0.03, 0.05),
+  gamma = c(0.25, 0.5),
+  colsample_bytree = 0.8,
+  min_child_weight = c(3, 5),
+  subsample = 0.8
+)
+
+set.seed(123)
+
+xgb_model6b = train(
+  loan_default ~ .,
+  data = train_trees_logs,
+  method = "xgbTree",
+  trControl = cv_control,
+  tuneGrid = grid_final,
+  metric = "ROC",             # still optimizing AUC for ranking stability
+  tree_method = "hist",
+  scale_pos_weight = 5.5,       # bumping up again from 5 -> 6
+  eval_metric = "auc"
+)
+
+xgb_model6b$bestTune
+max(xgb_model6b$results$ROC)
+
+
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+## predictions and confusion matrix
+```{r, eval=FALSE}
+
+tree_preds$xgb6_class = predict(xgb_model6b,
+                                newdata = holdout_trees_logs,
+                                type = "raw")
+
+tree_preds$xgb6_prob = predict(xgb_model6b,
+                                newdata = holdout_trees_logs,
+                                type = "prob")[,"Yes"]
+
+pred_probs = predict(xgb_model6b, newdata = holdout_trees_logs, type = "prob")[, "Yes"]
+thresholds = seq(0.001, 0.15, by = 0.001) ## honed in on this range over time, most opt thresholds have been 0.1
+f1s = sapply(thresholds, function(t) {
+  preds = ifelse(pred_probs > t, "Yes", "No")
+  MLmetrics::F1_Score(y_pred = preds, y_true = holdout_trees_logs$loan_default, positive = "Yes")
+})
+best_thresh = thresholds[which.max(f1s)]
+cat("Best F1 threshold:", best_thresh, "\n")
+
+
+
+tree_preds$xgb6_class = ifelse(tree_preds$xgb6_prob > best_thresh, "Yes", "No") 
+
+confusionMatrix(factor(tree_preds$xgb6_class, levels = c("No", "Yes")),
+                factor(tree_preds$Actuals, levels = c("No", "Yes")),
+                positive = "Yes")
+
+final_f1 = F1_Score(
+  y_pred = tree_preds$xgb6_class,
+  y_true = tree_preds$Actuals,
+  positive = "Yes"
+)
+
+cat(sprintf("Final F1 Score (threshold %.2f): %.4f\n", best_thresh, final_f1))
+
+xgb.plot.importance(xgb.importance(model = xgb_model6b$finalModel))
+
+```
+i anticipated performance to suffer a little because of the removed date vars, but this is worse than i expected. The model is overpredicting Yes class resulting in Accuracy worse than the no information rate. i am going to attempt to run it again with a more aggressive weight, and add new interaction terms in that capture risk over the age of the loan (loan_amnt x loan_age, open_acct x loan_age, etc) -- I am going to run the same code chunk again and update the weight 
+
+After running again, recall is now back up in the 60%s but overall accuracy has suffered. The model is still over predicting Yes's. Going to add the new variables, and try again to see if they make a difference 
+
+###Adding Interaction Terms
+```{r}
+train_trees_logs = train_trees_logs %>%
+  mutate(loan_age2 = loan_age^2)
+
+holdout_trees_logs = holdout_trees_logs %>%
+  mutate(loan_age2 = loan_age^2)
+```
+loan_age squared should penalize loans that have been open longer. Is an older loan more likely to default? and does that risk grow exponentially over time?
+
+## fitting same model again, without raw date cols
+```{r model6, eval=FALSE}
+
+cores = parallel::detectCores()
+cl = parallel::makeCluster(cores - 1)
+registerDoParallel(cl)
+
+
+cv_control = trainControl(
+  method = "cv",
+  number = 5,                        
+  summaryFunction = twoClassSummary, # allows ROC metric
+  classProbs = TRUE,                 # needed for AUC / ROC
+  savePredictions = "final",
+  allowParallel = TRUE
+)
+
+# --- 2️⃣ Updated tuning grid ---
+grid_final = expand.grid(
+  nrounds = c(600, 800),            
+  max_depth = c(8, 9, 12),            
+  eta = c(0.03, 0.05),
+  gamma = c(0.25, 0.5),
+  colsample_bytree = 0.8,
+  min_child_weight = c(3, 5),
+  subsample = 0.8
+)
+
+
+set.seed(123)
+
+xgb_model6c = train(
+  loan_default ~ .,
+  data = train_trees_logs,
+  method = "xgbTree",
+  trControl = cv_control,
+  tuneGrid = grid_final,
+  metric = "ROC",             # still optimizing AUC for ranking stability
+  tree_method = "hist",
+  scale_pos_weight = 5.5,       # bumping up again from 5 -> 6 -- 5.5 is good middlground
+  eval_metric = "auc"
+)
+
+
+xgb_model6c$bestTune
+max(xgb_model6c$results$ROC)
+
+
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+
+## predictions and confusion matrix
+```{r}
+file = "xgb_model6.rds"
+xgb_model6c = readRDS(file)
+
+tree_preds$xgb6_class = predict(xgb_model6c,
+                                newdata = holdout_trees_logs,
+                                type = "raw")
+
+tree_preds$xgb6_prob = predict(xgb_model6c,
+                                newdata = holdout_trees_logs,
+                                type = "prob")[,"Yes"]
+
+pred_probs = predict(xgb_model6c, newdata = holdout_trees_logs, type = "prob")[, "Yes"]
+thresholds = seq(0.001, 0.15, by = 0.001) ## honed in on this range over time, most opt thresholds have been 0.1
+f1s = sapply(thresholds, function(t) {
+  preds = ifelse(pred_probs > t, "Yes", "No")
+  MLmetrics::F1_Score(y_pred = preds, y_true = tree_preds$Actuals, positive = "Yes")
+})
+best_thresh = thresholds[which.max(f1s)]
+cat("Best F1 threshold:", best_thresh, "\n")
+
+
+
+tree_preds$xgb6_class = ifelse(tree_preds$xgb6_prob > best_thresh, "Yes", "No") 
+
+confusionMatrix(factor(tree_preds$xgb6_class, levels = c("No", "Yes")),
+                factor(tree_preds$Actuals, levels = c("No", "Yes")),
+                positive = "Yes")
+
+final_f1 = F1_Score(
+  y_pred = tree_preds$xgb6_class,
+  y_true = tree_preds$Actuals,
+  positive = "Yes"
+)
+
+cat(sprintf("Final F1 Score (threshold %.2f): %.4f\n", best_thresh, final_f1))
+
+xgb.plot.importance(xgb.importance(model = xgb_model6c$finalModel))
+
+```
+
+It does Not appear these new features are really adding anything, performance did not imporove at all from them being added. I am going to take them out, and add a loan_age squared variable to hopefully capture some information about risk to better capture less risky defaulters. I also am running back through this model, reintroducting last_credit_pull because i think it has some predictive power on its own. More recent pulls might indicate weaker credit or higher liklihood of default
+
+After running it again, it does not appear that loan age squared became a top var but recall and precision did improve. despite Adding last_credit_pull back in, it was not in the top variables for importance. Still one of the best models yet, with .57 F1, 65% recall. 1 thing i did recognize is that some loan_age's are negative or below 0. This is a slightly flaw in the way i calculated loan age. It is not technically a loan age (but i dont know what else to call it.) I am going to limit negative loan_age's to 0 to indicate their most recent pull is from before the loan (i will apply this where i created the var)
+
+Going back and fixing the problems with the data improved the model further. Recall is now 66%, F1 is still .57, detection rate is 13%. I am comfortable with these results i am going to save this form of the model
+## saving model
+```{r}
+#saveRDS(xgb_model6c, "xgb_model6.rds")
+```
+
+
+# Model 7 -- Running a model on our balanced dataset instead of balancing using weight
+I wanted to try a manually balanced data set to see if the results are any better/worse
+
+```{r model7, eval=FALSE}
+train_trees_log_balanced = train_trees_logs %>%
+  group_by(loan_default) %>%
+  sample_n(size = min(table(train_trees_logs$loan_default))) %>%
+  ungroup()
+
+table(train_trees_log_balanced$loan_default) # it is balanced
+
+saveRDS(train_trees_log_balanced, "train_trees_log_balanced.rds")
+
+# running model6c (best model) on balanced data
+cores = parallel::detectCores()
+cl = parallel::makeCluster(cores - 1)
+registerDoParallel(cl)
+
+cv_control = trainControl(
+  method = "cv",
+  number = 5,                        
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE,                 
+  savePredictions = "final",
+  allowParallel = TRUE
+)
+
+grid_final = expand.grid(
+  nrounds = c(600, 800),             
+  max_depth = c(8, 9, 12),           
+  eta = c(0.03, 0.05),
+  gamma = c(0.25, 0.5),
+  colsample_bytree = 0.8,
+  min_child_weight = c(3, 5),
+  subsample = 0.8
+)
+
+set.seed(123)
+
+xgb_model7 = train(
+  loan_default ~ .,
+  data = train_trees_log_balanced,
+  method = "xgbTree",
+  trControl = cv_control,
+  tuneGrid = grid_final,
+  metric = "ROC",             # still optimizing AUC for ranking stability
+  tree_method = "hist",
+  eval_metric = "auc"
+)
+
+xgb_model7$bestTune
+max(xgb_model7$results$ROC)
+
+
+stopCluster(cl)
+registerDoSEQ()
+
+
+
+```
+
+## predictions and confusion matrix
+```{r}
+
+file = "xgb_model7.rds"
+xgb_model7 = readRDS(file)
+
+tree_preds$xgb7_class = predict(xgb_model7,
+                                newdata = holdout_trees_logs,
+                                type = "raw")
+
+tree_preds$xgb7_prob = predict(xgb_model7,
+                                newdata = holdout_trees_logs,
+                                type = "prob")[,"Yes"]
+
+pred_probs = predict(xgb_model7, newdata = holdout_trees_logs, type = "prob")[, "Yes"]
+thresholds = seq(0.001, 0.9, by = 0.001) ## honed in on this range over time, most opt thresholds have been 0.1
+f1s = sapply(thresholds, function(t) {
+  preds = ifelse(pred_probs > t, "Yes", "No")
+  MLmetrics::F1_Score(y_pred = preds, y_true = tree_preds$Actuals, positive = "Yes")
+})
+best_thresh = thresholds[which.max(f1s)]
+cat("Best F1 threshold:", best_thresh, "\n")
+
+
+
+tree_preds$xgb7_class = ifelse(tree_preds$xgb7_prob > best_thresh, "Yes", "No") 
+
+confusionMatrix(factor(tree_preds$xgb7_class, levels = c("No", "Yes")),
+                factor(tree_preds$Actuals, levels = c("No", "Yes")),
+                positive = "Yes")
+
+final_f1 = F1_Score(
+  y_pred = tree_preds$xgb7_class,
+  y_true = tree_preds$Actuals,
+  positive = "Yes"
+)
+
+cat(sprintf("Final F1 Score (threshold %.2f): %.4f\n", best_thresh, final_f1))
+
+print(xgb_model7$bestTune)
+head(xgb_model7$results)
+
+xgb.plot.importance(xgb.importance(model = xgb_model7$finalModel))
+
+```
+Very similar model to some of the previous models. 1310 detection is the best so far. I am going to try to push this balanced dataset further 
+
+
+
+# Comparing models and determining best model
+
+```{r}
+
+
+#gathering metrics for each model
+get_metrics = function(preds, probs, actual) {
+  actual = factor(as.character(actual), levels = c("No", "Yes"))
+  preds  = factor(as.character(preds), levels = c("No", "Yes"))
+  probs  = as.numeric(probs)
+
+  cm = caret::confusionMatrix(preds, actual, positive = "Yes")
+  precision = cm$byClass["Pos Pred Value"]
+  recall = cm$byClass["Sensitivity"]
+  f1 = ifelse(is.na(precision) | is.na(recall) | (precision + recall == 0), 
+               0, 2 * (precision * recall) / (precision + recall))
+  auc_val = pROC::auc(ifelse(actual == "Yes", 1, 0), probs, direction = "<")
+  TP = cm$table["Yes", "Yes"]
+  detection_rate = TP / sum(cm$table)
+
+  tibble(
+    Accuracy = round(cm$overall["Accuracy"], 4),
+    Recall = round(recall, 4),
+    Precision = round(precision, 4),
+    F1 = round(f1, 4),
+    Balanced_Accuracy = round(cm$byClass["Balanced Accuracy"], 4),
+    Detection_Rate = round(detection_rate, 4),
+    AUC = round(as.numeric(auc_val), 4)
+  )
+}
+
+# Map over all xgb models dynamically
+model_ids = paste0("xgb", 1:7)
+
+model_comparison = map_dfr(model_ids, function(id) {
+  get_metrics(tree_preds[[paste0(id, "_class")]],
+              tree_preds[[paste0(id, "_prob")]],
+              tree_preds$Actuals) %>%
+    mutate(Model = id)
+}) %>%
+  select(Model, everything()) %>%
+  arrange(desc(F1))
+
+model_comparison
+```
+xgb model 6 appears to be the best model so far. It has the highest recall, F1, balanced accuracy and detection rate compared to the other 5. It looks like some of the extra feature engineering paid off.
+
+### Saving best model
+```{r}
+saveRDS(xgb_model6c, "best_xgb.rds")
+saveRDS(tree_preds, "tree_preds.rds")
+```
